@@ -19,7 +19,8 @@ import { mountPlayerRanges, playerRange, showCurrentVolume } from './player-rang
 import { mountCoverParallax } from './cover-parallax.ts';
 import { mountSidebar } from './sidebar.ts';
 import { animateDeck, animateLyricEcho, animatePlayerButton, scrollToLyric, stopLyricsScroll } from './player-motion.ts';
-import { interfaceMotion } from './springs.ts';
+import { interfaceMotion, springFrames } from './springs.ts';
+import { readRecentSearch, recordSearchItem, refreshSearchArtist, type SearchHistorySection } from './recent-search.ts';
 import { applyAccountLibrary, LibrarySync } from './account-library.ts';
 import { PlaybackDevices } from './playback-devices.ts';
 import { desktopUpdate, Downloads, invokeDesktop, localDesktop, windowsDesktop } from './desktop.ts';
@@ -56,6 +57,9 @@ let visibleTracks: Track[] = [];
 let searchResults: SearchResults | undefined;
 let searchFilter = 'all';
 let searchQuery = '';
+let searchByLyrics = false;
+const expandedSearchHistory = new Set<SearchHistorySection>();
+const searchModePlaceholder = () => searchByLyrics ? 'Введите строчку, которую помните' : 'Трек, исполнитель или альбом';
 const SEARCH_HISTORY_KEY='yamusic.search-history.v1';
 let searchHistory=restoreSearchHistory(localStorage.getItem(SEARCH_HISTORY_KEY));
 let searchHistoryTimer=0;
@@ -360,11 +364,11 @@ for(const event of ['pointerover','focusin']) main.addEventListener(event,e=>{
   },200);
 });
 
-function row(track: Track, index = 0, playAction = 'play'): string {
+function row(track: Track, index = 0): string {
   const liked = library.likes.some(t => t.id === track.id);
   return `<div class="track-row ${player.current?.id === track.id ? 'current-track' : ''}" data-track-row="${e(track.id)}">
     <span class="track-number">${String(index + 1).padStart(2, '0')}</span>
-    <button class="track-cover" data-action="${playAction}" data-id="${e(track.id)}" aria-label="Включить ${e(track.title)}">${image(track.cover_url)}<span class="cover-play">${icon('play')}</span></button>
+    <button class="track-cover" data-action="play" data-id="${e(track.id)}" aria-label="Включить ${e(track.title)}">${image(track.cover_url)}<span class="cover-play">${icon('play')}</span></button>
     <div class="track-title"><a class="track-name" href="#/album/${track.album_id}" data-action="album" data-id="${track.album_id}"><strong class="moving-title-text">${e(track.title)}${track.is_explicit ? '<span class="explicit-badge" title="Ненормативная лексика">E</span>' : ''}</strong></a>${artistLinks(track, "track-artist")}</div>
     <button class="track-album" data-action="album" data-id="${track.album_id}">${e(track.album)}</button>
     <span class="track-duration">${formatTime(track.duration_sec)}</span>
@@ -435,79 +439,212 @@ function home(): void {
 }
 
 function search(): void {
-  main.innerHTML = `<div class="page-heading"><div><span class="eyebrow">ВЕСЬ МИР МУЗЫКИ</span><h1>Поиск</h1></div></div><form class="search-form" id="search-form" role="search">${icon('search')}<input id="search-input" name="q" type="search" placeholder="Трек, исполнитель или альбом" autocomplete="off" aria-label="Поиск музыки" maxlength="200" value="${e(searchQuery)}"/><kbd>↵</kbd></form><button class="text-button lyric-search-link" data-action="search-by-lyrics">${icon('sparkles')}Найти по строке песни</button><div class="filter-row"><div class="tab-pill-group" role="group" aria-label="Что искать">${[['all','Всё'],['track','Треки'],['album','Альбомы'],['artist','Исполнители']].map(([id,title])=>`<button class="chip ${searchFilter === id ? 'selected' : ''}" data-action="search-filter" data-filter="${id}" aria-pressed="${searchFilter === id}">${title}</button>`).join('')}</div></div><div id="search-results"></div>`;
-  if (searchQuery && searchResults) drawSearchResults();
+  main.innerHTML = `<div class="page-heading"><div><span class="eyebrow">ВЕСЬ МИР МУЗЫКИ</span><h1>Поиск</h1></div></div>
+    <form class="search-form" id="search-form" role="search">${icon('search')}
+      <input id="search-input" name="q" type="search" placeholder="${searchModePlaceholder()}" autocomplete="off" aria-label="Поиск музыки" maxlength="200" value="${e(searchQuery)}"/>
+      <button class="search-mode" type="button" data-action="search-by-lyrics" aria-pressed="${searchByLyrics}">${icon('sparkles')}По тексту</button>
+    </form>
+    <div id="search-filters" class="filter-row" ${searchByLyrics ? 'hidden' : ''}>
+      <div class="tab-pill-group" role="group" aria-label="Что искать">${[['all','Всё'],['track','Треки'],['album','Альбомы'],['artist','Исполнители']].map(([id,title])=>`<button class="chip ${searchFilter === id ? 'selected' : ''}" data-action="search-filter" data-filter="${id}" aria-pressed="${searchFilter === id}">${title}</button>`).join('')}</div>
+    </div><div id="search-results" aria-live="polite"></div>`;
+  main.querySelector('#search-form')!.classList.toggle('lyrics-mode', searchByLyrics);
+  if (searchQuery && searchResults) {
+    visibleTracks = searchResults.tracks;
+    drawSearchResults();
+  } else if (searchQuery && searchByLyrics) drawLyricsSearchPrompt();
   else if (searchQuery) void runSearch();
   else drawSearchStart();
   hydrateIcons(main);
-  syncTabPill(main.querySelector<HTMLElement>(".tab-pill-group")!);
+  syncTabPill(main.querySelector<HTMLElement>('.tab-pill-group')!);
 }
-function saveSearchHistory():void {try{localStorage.setItem(libraryUser===undefined?SEARCH_HISTORY_KEY:`${SEARCH_HISTORY_KEY}.${libraryUser}`,JSON.stringify(searchHistory));librarySync?.capture(library,searchHistory);}catch{/* Browsing remains available with full storage. */}}
-function rememberCurrentSearch():void {if(!searchQuery.trim())return;searchHistory=rememberSearch(searchHistory,searchQuery);saveSearchHistory();}
-function drawSearchStart(): void {
-  loadMoodCovers();
-  document.querySelector('#search-results')!.innerHTML = `<section class="section search-history">${sectionHeading('Вы недавно искали',searchHistory.length?'<button class="text-button" data-action="clear-search-history">Очистить</button>':'')}${searchHistory.length?`<div class="search-history-items">${searchHistory.map((q,index)=>`<span class="history-chip"><button data-action="search-suggestion" data-query="${e(q)}">${e(q)}</button><button data-action="remove-search-history" data-index="${index}" aria-label="Убрать ${e(q)} из истории">${icon('x')}</button></span>`).join('')}</div>`:'<p class="muted">Здесь появятся ваши поисковые запросы. Историю можно очистить в любой момент.</p>'}</section><section class="section">${sectionHeading('Что послушаем?', '', 'Выберите настроение или найдите что-то своё')}<div class="card-rail">${moods.map(moodCard).join('')}</div></section>`;
-  hydrateIcons(main);
-}
-let lyricSearchRequest: AbortController | undefined;
-let lyricMatches: Track[] = [];
-function openLyricSearch(): void {
-  const query=main.querySelector<HTMLInputElement>('#search-input')?.value.trim()??'';
-  showDialog('Поиск по строке песни',`
-    <form id="lyric-search-form" class="lyric-search-form">
-      <label for="lyric-search-input">Вставьте несколько слов, которые помните. Можно добавить имя исполнителя.</label>
-      <input id="lyric-search-input" class="text-input" name="line" maxlength="200" required value="${e(query)}" placeholder="Строка из песни" autofocus>
-      <button class="primary-button" type="submit">Найти песню</button>
-    </form><div id="lyric-search-results" aria-live="polite"></div>`);
-}
-async function findByLyrics(form: HTMLFormElement): Promise<void> {
-  const input=form.querySelector('input')!;
-  const phrase=input.value.trim();
-  if(phrase.length<2){input.focus();return;}
-  lyricSearchRequest?.abort();
-  const controller=new AbortController();
-  lyricSearchRequest=controller;
-  lyricMatches=[];
-  const result=dialog.querySelector<HTMLElement>('#lyric-search-results')!;
-  const submit=form.querySelector('button')!;
-  submit.disabled=true;
-  result.textContent='Ищем песню по словам…';
+
+function saveSearchHistory(): void {
   try {
-    const {tracks}=await api.smartSearch(phrase,controller.signal);
-    if(controller.signal.aborted||!result.isConnected)return;
-    lyricMatches=register(tracks);
-    result.innerHTML=tracks.length?`<div class="track-list">${tracks.map((track,index)=>row(track,index,'play-lyric-match')).join('')}</div>`:
-      '<p class="muted">Совпадений не нашлось. Попробуйте другую строку или добавьте имя исполнителя.</p>';
-    hydrateIcons(result);
-  } catch(error) {
-    if(!controller.signal.aborted&&result.isConnected)result.textContent=error instanceof Error?error.message:'Не удалось выполнить поиск.';
-  } finally { if(submit.isConnected)submit.disabled=false; }
+    localStorage.setItem(libraryUser === undefined ? SEARCH_HISTORY_KEY : `${SEARCH_HISTORY_KEY}.${libraryUser}`, JSON.stringify(searchHistory));
+    librarySync?.capture(library, searchHistory);
+  } catch { /* Browsing remains available with full storage. */ }
 }
+
+function rememberCurrentSearch(): void {
+  if (!searchQuery) return;
+  searchHistory = rememberSearch(searchHistory, searchQuery);
+  saveSearchHistory();
+}
+
+const historyTitles = { tracks: 'Недавние треки', albums: 'Альбомы', artists: 'Исполнители' };
+const historySections = ['tracks', 'albums', 'artists'] as const;
+const searchHistorySpring = springFrames(260, 24, 420);
+
+function searchHistoryContent(kind: SearchHistorySection, recent: ReturnType<typeof readRecentSearch>): string {
+  const limit = expandedSearchHistory.has(kind) ? recent[kind].length : 5;
+  if (kind === 'tracks') return rows(recent.tracks.slice(0, limit));
+  const cards = kind === 'albums' ? recent.albums.slice(0, limit).map(albumCard) : recent.artists.slice(0, limit).map(artistCard);
+  return `<div class="search-history-rail${expandedSearchHistory.has(kind) ? ' is-expanded' : ''}">${cards.join('')}</div>`;
+}
+
+function drawSearchStart(): void {
+  const results = main.querySelector<HTMLElement>('#search-results');
+  if (!results) return;
+  results.inert = false;
+  const recent = readRecentSearch(authUser?.id);
+  visibleTracks = recent.tracks;
+  const sections = historySections.map(kind => {
+    if (!recent[kind].length) return '';
+    const open = expandedSearchHistory.has(kind);
+    const action = recent[kind].length > 5 ? `<button class="text-button" type="button" data-action="search-history-expand" data-kind="${kind}" aria-label="${open ? 'Свернуть' : 'Показать все'} · ${historyTitles[kind]}" aria-controls="search-history-${kind}" aria-expanded="${open}">${open ? 'Свернуть' : 'Показать все'} ${icon(open ? 'chevron-down' : 'arrow-right')}</button>` : '';
+    return `<section class="section search-history">${sectionHeading(historyTitles[kind],action)}<div id="search-history-${kind}">${searchHistoryContent(kind,recent)}</div></section>`;
+  }).join('');
+  const queries = searchHistory.length ? `<section class="section search-history">${sectionHeading('Запросы','<button class="text-button" data-action="clear-search-history">Очистить</button>')}
+    <div class="search-history-items">${searchHistory.map((q,index)=>`<span class="history-chip"><button type="button" data-action="search-suggestion" data-query="${e(q)}">${e(q)}</button><button type="button" class="remove-query" data-action="remove-search-history" data-index="${index}" aria-label="Убрать ${e(q)} из истории">${icon('x')}</button></span>`).join('')}</div></section>` : '';
+  if (sections || queries) results.innerHTML = sections + queries;
+  else {
+    loadMoodCovers();
+    results.innerHTML = `<section class="section">${sectionHeading('Что послушаем?', '', 'Выберите настроение или найдите что-то своё')}<div class="card-rail">${moods.map(moodCard).join('')}</div></section>`;
+  }
+  hydrateIcons(results);
+}
+
+function toggleSearchHistory(button: HTMLElement): void {
+  const kind = historySections.find(section => section === button.dataset.kind);
+  const content = kind && main.querySelector<HTMLElement>(`#search-history-${kind}`);
+  if (!kind || !content) return;
+  const from = content.getBoundingClientRect().height;
+  content.getAnimations().forEach(animation => animation.cancel());
+  const open = !expandedSearchHistory.has(kind);
+  if (open) expandedSearchHistory.add(kind); else expandedSearchHistory.delete(kind);
+  button.setAttribute('aria-expanded', String(open));
+  button.setAttribute('aria-label', `${open ? 'Свернуть' : 'Показать все'} · ${historyTitles[kind]}`);
+  button.innerHTML = `${open ? 'Свернуть' : 'Показать все'} ${icon(open ? 'chevron-down' : 'arrow-right')}`;
+  content.innerHTML = searchHistoryContent(kind, readRecentSearch(authUser?.id));
+  hydrateIcons(button);
+  hydrateIcons(content);
+  if (interfaceMotion()) {
+    const to = content.getBoundingClientRect().height;
+    if (from !== to) {
+      content.animate(searchHistorySpring.map(p => ({
+        height: `${Math.max(0, from + (to - from) * p)}px`, overflow: 'clip',
+      })), 420);
+    }
+    if (open) [...content.querySelectorAll<HTMLElement>('.track-row, .music-card')].slice(5, 10).forEach((item, i) => {
+      item.animate([{ opacity: 0, translate: '0 6px' }, { opacity: 1, translate: '0 0' }], {
+        duration: 280, delay: 35 * i, fill: 'backwards', easing: 'ease-out',
+      });
+    });
+  }
+}
+
+function rememberOpenedResult(target: HTMLElement): void {
+  if (currentView !== 'search' || !searchResults || !target.closest('#search-results')) return;
+  const id = target.dataset.id;
+  const account = authUser?.id;
+  const action = target.dataset.action;
+  if (action === 'play' || target.matches('.track-name')) {
+    const track = searchResults.tracks.find(item => item.id === (target.closest<HTMLElement>('[data-track-row]')?.dataset.trackRow ?? id));
+    if (track) recordSearchItem(account, 'tracks', track);
+  }
+  if (action === 'album') {
+    const track = searchResults.tracks.find(item => String(item.album_id) === id);
+    const album = searchResults.albums.find(item => String(item.id) === id);
+    if (album) recordSearchItem(account, 'albums', album);
+    else if (track) recordSearchItem(account, 'albums', { id: track.album_id, title: track.album, artist: track.artist, artist_id: track.artist_id, cover_url: track.cover_url, track_count: 0 });
+  } else if (action === 'artist') {
+    const artist = searchResults.artists.find(item => String(item.id) === id);
+    if (artist) recordSearchItem(account, 'artists', artist);
+    else {
+      const credit = searchResults.tracks.flatMap(trackArtists).find(item => String(item.id) === id);
+      if (credit) recordSearchItem(account, 'artists', { id: credit.id, name: credit.name, picture_url: '' });
+    }
+  }
+}
+
+function drawLyricsSearchPrompt(): void {
+  const results = main.querySelector<HTMLElement>('#search-results');
+  if (!results) return;
+  results.inert = false;
+  results.innerHTML = '<button type="submit" form="search-form" class="secondary-button lyrics-search-submit">Найти трек</button>';
+}
+
+function toggleSearchByLyrics(): void {
+  const input = main.querySelector<HTMLInputElement>('#search-input')!;
+  const form = input.form!;
+  const filters = main.querySelector<HTMLElement>('#search-filters')!;
+  clearTimeout(searchTimer);
+  clearTimeout(searchHistoryTimer);
+  searchRequest?.abort();
+  if (searchResults) rememberCurrentSearch();
+  searchResults = undefined;
+  visibleTracks = [];
+  searchByLyrics = !searchByLyrics;
+  searchQuery = input.value.trim();
+  form.classList.toggle('lyrics-mode', searchByLyrics);
+  form.querySelector('[data-action="search-by-lyrics"]')!.setAttribute('aria-pressed', String(searchByLyrics));
+  input.placeholder = searchModePlaceholder();
+  filters.hidden = searchByLyrics;
+  input.focus();
+  if (searchByLyrics && interfaceMotion()) {
+    form.animate([
+      { borderColor: 'rgba(255,255,255,.45)', boxShadow: '0 0 0 0 rgba(255,255,255,0)' },
+      { borderColor: 'rgba(255,255,255,.92)', boxShadow: '0 0 0 3px rgba(255,255,255,.09), 0 0 12px rgba(255,255,255,.09)', offset: .42 },
+      { borderColor: 'rgba(255,255,255,.48)', boxShadow: '0 0 0 1px rgba(255,255,255,.025)' },
+    ], { duration: 910, easing: 'ease-in-out', id: 'lyrics-border-pulse' });
+  } else {
+    form.getAnimations().find(animation => animation.id === 'lyrics-border-pulse')?.cancel();
+    syncTabPill(filters.querySelector<HTMLElement>('.tab-pill-group')!);
+  }
+  if (!searchQuery) drawSearchStart();
+  else if (searchByLyrics) drawLyricsSearchPrompt();
+  else void runSearch();
+}
+
 async function runSearch(): Promise<void> {
-  const input = document.querySelector<HTMLInputElement>('#search-input');
-  const query = (input?.value ?? searchQuery).trim();
-  clearTimeout(searchHistoryTimer);searchQuery = query; searchRequest?.abort(); searchResults = undefined;
+  const container = main.querySelector<HTMLElement>('#search-results');
+  if (!container) return;
+  container.inert = false;
+  const query = (main.querySelector<HTMLInputElement>('#search-input')?.value ?? '').trim();
+  const lyrics = searchByLyrics;
+  clearTimeout(searchTimer);
+  clearTimeout(searchHistoryTimer);
+  searchQuery = query;
+  searchRequest?.abort();
+  searchResults = undefined;
+  visibleTracks = [];
   if (!query) { drawSearchStart(); return; }
-  const container = document.querySelector('#search-results'); if (!container) return;
-  container.innerHTML = loading();
-  const controller = new AbortController(); searchRequest = controller;
+  if (lyrics && query.length < 2) {
+    container.innerHTML = '<p class="muted">Введите хотя бы два символа.</p>';
+    return;
+  }
+  container.innerHTML = lyrics ? '<p class="muted">Ищем песню по словам…</p>' : loading();
+  const controller = new AbortController();
+  searchRequest = controller;
   const gen = generation;
   try {
-    const result = await api.search(query, searchFilter, 0, controller.signal);
+    let result: SearchResults;
+    if (lyrics) {
+      const { tracks } = await api.smartSearch(query, controller.signal);
+      result = { tracks, artists: [], albums: [], total: tracks.length, source: 'lyrics' };
+    } else {
+      result = await api.search(query, searchFilter, 0, controller.signal);
+    }
     if (gen !== generation || controller.signal.aborted) return;
-    searchResults = result; register(result.tracks); api.prepare(result.tracks.slice(0,3)); visibleTracks = result.tracks; drawSearchResults();
-    searchHistoryTimer=window.setTimeout(()=>{if(searchQuery===query)rememberCurrentSearch();},1500);
-
+    searchResults = result;
+    visibleTracks = result.tracks;
+    drawSearchResults();
+    searchHistoryTimer = window.setTimeout(rememberCurrentSearch, 1500);
   } catch (error) {
     if (gen !== generation || controller.signal.aborted) return;
-    container.innerHTML = errorState(error); hydrateIcons(main);
+    container.innerHTML = errorState(error);
+    hydrateIcons(main);
   }
 }
 function drawSearchResults(): void {
   const data = searchResults; if (!data) return;
   const container = document.querySelector('#search-results')!;
-  if (!data.tracks.length && !data.albums.length && !data.artists.length) {
+  if (searchByLyrics && !data.tracks.length) {
+    container.innerHTML = empty('Совпадений не нашлось', 'Попробуйте другую строку или добавьте имя исполнителя.', 'search');
+  } else if (!data.tracks.length && !data.albums.length && !data.artists.length) {
     container.innerHTML = empty('Пока ничего не нашлось', 'Попробуйте другое название или имя исполнителя.', 'search');
+  } else if (searchByLyrics) {
+    container.innerHTML = sectionHeading('Треки') + rows(data.tracks);
   } else {
     container.innerHTML = `<p class="results-caption">Результаты по запросу «${e(searchQuery)}»</p>${data.artists.length ? `<section class="section artists-section">${sectionHeading('Исполнители')}<div class="artist-rail">${data.artists.slice(0, searchFilter === 'all' ? 4 : 12).map(artistCard).join('')}</div></section>` : ''}${data.tracks.length ? `<section class="section">${sectionHeading('Треки', '<span class="subtle-label">Каталог Deezer</span>')}${rows(data.tracks, searchFilter === 'all' ? 6 : 24)}</section>` : ''}${data.albums.length ? `<section class="section">${sectionHeading('Альбомы')}<div class="${searchFilter === 'all' ? 'card-rail' : 'card-grid'}">${data.albums.slice(0, searchFilter === 'all' ? 5 : 24).map(albumCard).join('')}</div></section>` : ''}<p class="page-footnote">Каталог Deezer · доступны первые ${data.tracks.length + data.artists.length + data.albums.length} результатов</p>`;
   }
@@ -632,6 +769,7 @@ async function detail(kind: string, id: string, gen: number): Promise<void> {
       main.innerHTML = `<div class="collection-header"><div class="collection-art">${image(data.album.cover_url)}</div><div><span class="eyebrow">АЛЬБОМ</span><h1>${e(data.album.title)}</h1><button class="artist-link" data-action="artist" data-id="${data.album.artist_id}">${e(data.album.artist)} ${icon('arrow-up-right')}</button><p>${trackCount(data.tracks.length)} · Deezer</p><button class="primary-button" data-action="play-list" ${data.tracks.length ? '' : 'disabled'}>${icon('play')}Слушать</button></div></div>${rows(data.tracks)}`;
     } else {
       const data = await api.artist(Number(id)); if (gen !== generation) return;
+      refreshSearchArtist(authUser?.id, data.artist);
       visibleTracks = register(data.tracks);
       main.innerHTML = `<div class="collection-header artist-header"><div class="collection-art">${image(data.artist.picture_url)}</div><div><span class="eyebrow">ИСПОЛНИТЕЛЬ</span><h1>${e(data.artist.name)}</h1><div class="collection-actions"><button class="primary-button" data-action="play-list" ${data.tracks.length ? '' : 'disabled'}>${icon('play')}Слушать</button><button class="secondary-button" data-action="artist-follow" data-id="${data.artist.id}" aria-pressed="false" disabled>Подписаться</button></div></div></div><section class="section">${sectionHeading('Треки')}${rows(data.tracks, 30)}</section><section class="section">${sectionHeading('Альбомы')}<div class="card-grid">${data.albums.map(albumCard).join('')}</div></section>`;
       const follow=main.querySelector<HTMLButtonElement>('[data-action="artist-follow"]')!;
@@ -645,7 +783,8 @@ function navigate(): void {
   if(!authUser)return;
   closeTranslationMenus?.(); closeTranslationMenus = undefined;
   closePlaylistMenu();closeSongActions();currentPlaylist=undefined;playlistSuggestions=[];
-    if(currentView==='search'&&searchResults)rememberCurrentSearch();
+  if(currentView==='search'&&searchResults)rememberCurrentSearch();
+  clearTimeout(searchHistoryTimer);
   generation++; searchRequest?.abort(); clearTimeout(searchTimer); wave?.destroy(); wave = undefined;
   const parts = location.hash.replace(/^#\/?/, '').split('/');
   const page = parts[0] || 'home';
@@ -930,7 +1069,8 @@ function renderSession(): void {
   playbackDevices?.close();playbackDevices=undefined;
   downloads=undefined;
   librarySync?.close();librarySync=undefined;libraryUser=undefined;
-  library=restoreLibrary(null);searchHistory=[];searchResults=undefined;searchQuery='';
+  library=restoreLibrary(null);searchHistory=[];searchResults=undefined;searchQuery='';searchByLyrics=false;expandedSearchHistory.clear();
+  clearTimeout(searchTimer);clearTimeout(searchHistoryTimer);
   if(dialog.open)dialog.close();
   closeQueue(); closePlaylistMenu(); closeSongActions();
   closeTranslationMenus?.(); closeTranslationMenus = undefined;
@@ -1762,6 +1902,7 @@ document.addEventListener('click', async event => {
   const target = clicked.closest<HTMLElement>('[data-action]');
   if (!target) { if(clicked.closest('#song-actions a')) queueMicrotask(()=>closeSongActions(true)); return; }
   const action = target.dataset.action, id = target.dataset.id || '';
+  rememberOpenedResult(target);
   if (target.matches('.transport-buttons button, .hero-controls button, [data-mobile-play], .player-extras button, .expanded-actions button, .mute-button')) {
     const controls = target.closest('.player-bar, .full-player-dialog');
     queueMicrotask(() => {
@@ -1853,8 +1994,16 @@ document.addEventListener('click', async event => {
     } finally {if(follow.isConnected)follow.disabled=false;}
   }
   else if(action==='favorite-artists')void openArtistPicker(dialog,showDialog,refreshArtistPreferences,toast);
-  else if(action==='clear-search-history'){searchHistory=[];saveSearchHistory();drawSearchStart();}
-  else if(action==='remove-search-history'){searchHistory.splice(Number(target.dataset.index),1);saveSearchHistory();drawSearchStart();}
+  else if (action === 'clear-search-history') {
+    searchHistory = []; saveSearchHistory(); drawSearchStart();
+    main.querySelector<HTMLInputElement>('#search-input')?.focus({ preventScroll: true });
+  }
+  else if (action === 'remove-search-history') {
+    const index = Number(target.dataset.index);
+    searchHistory.splice(index, 1); saveSearchHistory(); drawSearchStart();
+    (main.querySelector<HTMLElement>(`[data-action="remove-search-history"][data-index="${Math.min(index, searchHistory.length - 1)}"]`)
+      ?? main.querySelector<HTMLInputElement>('#search-input'))?.focus({ preventScroll: true });
+  }
   else if(action==='clear-listening-history'){showDialog('Очистить историю?', '<p class="dialog-description">Список прослушиваний исчезнет с этого устройства. Любимое и плейлисты сохранятся.</p><div class="dialog-actions"><button class="secondary-button" data-action="close">Отмена</button><button class="primary-button" data-action="confirm-clear-history">Очистить</button></div>');}
   else if(action==='confirm-clear-history'){library.history=[];librarySync?.clearHistory();save();dialog.close();historyView();}
   else if (action === 'choose-playlist-cover') dialog.querySelector<HTMLInputElement>('#playlist-cover-file')?.click();
@@ -1902,11 +2051,8 @@ document.addEventListener('click', async event => {
   else if (action === 'retry-lyrics') void loadLyrics();
   else if (action === 'track-menu') trackMenu(target,id);
   else if (action === 'play-list' || action === 'play-likes') { const list = action === 'play-likes' ? library.likes : visibleTracks; if (list[0]) player.play(list[0],list); }
-  else if (action === 'search-by-lyrics') openLyricSearch();
-  else if (action === 'play-lyric-match') {
-    const track=lyricMatches.find(item=>item.id===id);
-    if(track){dialog.close();player.play(track,lyricMatches);}
-  }
+  else if (action === 'search-by-lyrics') toggleSearchByLyrics();
+  else if (action === 'search-history-expand') toggleSearchHistory(target);
   else if (action === 'search-filter') {
     searchFilter = target.dataset.filter || 'all';
     selectPillButton(target.parentElement!, 'data-filter', searchFilter);
@@ -1943,7 +2089,6 @@ document.addEventListener('click', async event => {
 document.addEventListener('submit', event => {
   const form = event.target as HTMLFormElement;
   if (form.id === 'search-form') { event.preventDefault(); clearTimeout(searchTimer); void runSearch(); }
-  else if (form.id === 'lyric-search-form') { event.preventDefault();void findByLyrics(form); }
   else if (form.id === 'music-import-form') { event.preventDefault();void previewImport(form); }
   else if (form.id === 'playlist-form') {
     event.preventDefault(); const title = String(new FormData(form).get('title') || '').trim(); if (!title) return;
@@ -1971,7 +2116,18 @@ document.addEventListener('input', event => {
   }
   else if (input.matches('[data-volume]')) { player.setVolume(Number(input.value)); if(!player.mirroring){library.settings.volume = player.volume;save();} fillRange(input); showCurrentVolume(input); }
   else if (input.matches('[data-seek]')) { player.seek(Number(input.value)); fillRange(input); }
-  else if (input.id === 'search-input') { clearTimeout(searchTimer); searchTimer = window.setTimeout(()=>void runSearch(),450); }
+  else if (input.id === 'search-input') {
+    clearTimeout(searchTimer); clearTimeout(searchHistoryTimer); searchRequest?.abort();
+    if (searchResults && searchQuery !== input.value.trim()) rememberCurrentSearch();
+    searchQuery = input.value.trim(); searchResults = undefined; visibleTracks = [];
+    if (!searchQuery || searchByLyrics) {
+      if (searchQuery) drawLyricsSearchPrompt(); else drawSearchStart();
+    } else {
+      const results = main.querySelector<HTMLElement>('#search-results')!;
+      results.inert = true;
+      searchTimer = window.setTimeout(() => void runSearch(), 450);
+    }
+  }
   else if (input.id === 'playlist-description') resizePlaylistDescription(input as unknown as HTMLTextAreaElement);
   else if (input.matches('.playlist-menu-search')) {
     const query = input.value.trim().toLocaleLowerCase('ru');
@@ -2013,7 +2169,7 @@ document.addEventListener('change', async event => {
 });
 dialog.addEventListener('close',()=>{
   if (!dialog.open) {
-    lyricsRequest?.abort(); translationRequest?.abort(); importRequest?.abort(); lyricSearchRequest?.abort();
+    lyricsRequest?.abort(); translationRequest?.abort(); importRequest?.abort();
     if (dialog.contains(songActions)) closeSongActions();
     if (dialog.contains(queuePanel)) closeQueue();
     if (dialog.contains(playlistMenu)) closePlaylistMenu();

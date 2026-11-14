@@ -43,13 +43,33 @@
 .artist-choice.selected .artist-choice-check { opacity:1;transform:scale(1); }
 .artist-choice-check .icon { width:15px;height:15px; }
 .artist-picker-footer { display:flex;align-items:center;justify-content:space-between;gap:16px;position:sticky;bottom:-28px;padding:20px 0 8px;margin-top:24px;background:var(--surface);border-top:1px solid var(--line);z-index:2; }
+.view-search .search-form { max-width:none; padding-inline-end:7px; }
+.search-mode { display:inline-flex; align-items:center; gap:7px; border:1px solid transparent; border-radius:999px; padding:8px 14px; flex:none; background:var(--active); color:var(--text); font-size:12px; font-weight:650; white-space:nowrap; }
+.search-mode:hover { background:var(--active-hover); }
+.search-mode .icon { width:16px; height:16px; }
+.search-mode[aria-pressed="true"] { background:#ededee; color:#242426; border-color:#fff; }
+.search-form.lyrics-mode { border-color:#ffffff7a; box-shadow:0 0 0 1px #ffffff07; }
+.search-form.lyrics-mode + #search-filters[hidden] + #search-results { margin-top:30px; }
 .search-history { margin-bottom:30px; }
-.search-history-items { display:flex;flex-wrap:wrap;gap:10px; }
-.history-chip { display:flex;align-items:center;border:1px solid var(--line);background:var(--surface);border-radius:16px;overflow:hidden; }
-.history-chip button { padding:10px 13px;background:none;border:0;color:var(--text); }
-.history-chip button:last-child { padding:10px;border-left:1px solid var(--line);color:var(--muted); }
-.history-chip .icon { width:14px;height:14px; }
-.history-chip button:hover { background:var(--active); }
+.search-history .section-heading { margin-bottom:13px; }
+.search-history-rail { display:flex; align-items:flex-start; gap:22px; overflow:auto; padding:2px 3px 5px; }
+.search-history-rail.is-expanded { flex-wrap:wrap; }
+.search-history-rail .music-card { flex:0 0 102px; min-width:0; }
+.search-history-rail .artist-card { flex-basis:80px; width:80px; }
+.search-history-rail .artist-card > span:last-child { display:none; }
+.search-history-rail .card-title { margin-top:6px; }
+.view-search .search-history .track-number { display:block; }
+.search-history-items { display:flex; flex-wrap:wrap; gap:8px; }
+.history-chip { position:relative; display:inline-grid; min-width:0; max-width:100%; border:1px solid var(--line); background:var(--panel); border-radius:999px; }
+.history-chip > button:first-child { padding:6px 28px 6px 12px; min-height:34px; font-size:12px; text-align:left; overflow-wrap:anywhere; border-radius:inherit; }
+.history-chip .remove-query { position:absolute; right:3px; top:3px; padding:0; width:24px; height:24px; display:grid; place-items:center; border-radius:50%; color:var(--muted); }
+.history-chip .icon { width:11px; height:11px; }
+.history-chip button:hover { background:var(--active); color:var(--text); }
+@media (max-width:760px) {
+  .search-mode { gap:4px; padding:6px 8px; font-size:11px; }
+  .search-mode .icon { width:14px; height:14px; }
+  .view-search .search-history .track-number { display:none; }
+}
 .playlist-editor { display:grid;gap:12px; }
 .playlist-editor .field-label { margin:8px 0 0; }
 .playlist-editor textarea { resize:none;min-height:88px;overflow:hidden;font:inherit; }
@@ -114,10 +134,6 @@ button.compact-track:hover:not(:disabled),.compact-track.current { background:va
 .telegram-avatar img { position:absolute;inset:0; }
 .profile-avatar > .telegram-avatar > .icon { width:32px;height:32px; }
 [hidden] { display:none !important; }
-.lyric-search-link { margin-top:12px; }
-.lyric-search-form { display:grid; gap:10px; margin:10px 0 15px; font-size:13px; }
-.lyric-search-form button { justify-self:start; }
-#lyric-search-results { font-size:13px; }
 .crossfade-value { display:flex; align-items:center; gap:12px; width:min(230px,100%); }
 .crossfade-value output { min-width:35px; color:var(--soft); font-size:12px; }
 .jelly-slider {
