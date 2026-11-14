@@ -12,6 +12,7 @@ import { parseLrc, activeLine, retryLyrics } from './lyrics.ts';
 import type { LyricLine } from './lyrics.ts';
 import { languageCodes, languageName } from './translation-settings.ts';
 import { parseSpotifyExport, type SpotifyExportPlaylist } from './spotify-export.ts';
+import { animateDropdown, mountSpringSelect, mountSpringSwitch } from './spring-controls.ts';
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
 const dialog = document.querySelector<HTMLDialogElement>('#dialog')!;
@@ -422,19 +423,36 @@ function historyView(): void {
   hydrateIcons(main);
 }
 const translationLabels:Record<TranslationProvider,string>={mymemory:'MyMemory · бесплатно',deepseek:'ИИ',google:'Google Переводчик',deepl:'DeepL'};
-function openTranslationSettings(action: string): void {
-  const provider=action==='translation-provider';
-  const choices=provider ? Object.entries(translationLabels) :
-    languageCodes.map(code=>[code,languageName(code)]).sort((a,b)=>a[1].localeCompare(b[1],'ru'));
-  const selected=provider?library.settings.translation:library.settings.translationLanguage;
-  showDialog(provider?'Сервис перевода':'Язык перевода',
-    `${provider?'':'<input class="text-input" id="language-filter" type="search" placeholder="Найти язык" aria-label="Найти язык" autofocus>'}
-    <div class="action-list translation-choices">${choices.map(([code,label])=>`<button data-action="choose-${action}" data-id="${code}" aria-pressed="${code===selected}" ${provider&&((code==='google'&&!authConfig.google_translate)||(code==='deepl'&&!authConfig.deepl))?'disabled title="Сервис пока не подключён"':''}>${e(label)}${code===selected?icon('check'):''}</button>`).join('')}</div>`,
-    'translation-settings-dialog');
+const translationLanguages = languageCodes.map(value => ({ value, label: languageName(value) }))
+  .sort((a, b) => a.label.localeCompare(b.label, 'ru'));
+let closeTranslationMenus: (() => void) | undefined;
+
+function translationTrigger(id: string, label: string, value: string): string {
+  return `<button type="button" class="secondary-button spring-select" id="${id}" aria-label="${e(label)}: ${e(value)}" aria-haspopup="dialog" aria-expanded="false">
+    <span class="spring-select-label"><span class="spring-select-value">${e(value)}</span></span>${icon('chevron-down')}
+  </button>`;
+}
+
+function mountTranslationSettings(): void {
+  const providers = Object.entries(translationLabels).map(([value, label]) => ({
+    value, label, disabled: value === 'google' && !authConfig.google_translate || value === 'deepl' && !authConfig.deepl,
+  }));
+  const closeProvider = mountSpringSelect(
+    main.querySelector<HTMLButtonElement>('#translation-provider')!, 'Сервис перевода', providers, library.settings.translation,
+    value => { library.settings.translation = value as TranslationProvider; save(); },
+  );
+  const closeLanguage = mountSpringSelect(
+    main.querySelector<HTMLButtonElement>('#translation-language')!, 'Язык перевода', translationLanguages, library.settings.translationLanguage,
+    value => { library.settings.translationLanguage = value; save(); }, true,
+  );
+  closeTranslationMenus = () => { closeProvider(); closeLanguage(); };
 }
 function settings(): void {
-  main.innerHTML = `<div class="page-heading"><div><span class="eyebrow">ВАШЕ ПРОСТРАНСТВО</span><h1>Настройки</h1></div></div><div class="settings-content"><button class="profile-summary" data-action="account"><span class="profile-avatar" data-account-avatar>${accountAvatar()}</span><span><strong>${authUser?e(authUser.first_name||authUser.username||"Мой профиль"):"Мой профиль"}</strong><small>${authUser?"Telegram подключён":"Войти через Telegram"}</small></span>${icon('chevron-right')}</button><section class="settings-group"><h2>Оформление</h2><div class="setting-row"><div class="setting-label">${icon('palette')}<span>Тема</span></div><div class="segmented" role="group" aria-label="Цветовая тема"><button data-action="theme" data-theme="dark" class="${library.settings.theme === 'dark' ? 'selected' : ''}" aria-pressed="${library.settings.theme === 'dark'}">Тёмная</button><button data-action="theme" data-theme="light" class="${library.settings.theme === 'light' ? 'selected' : ''}" aria-pressed="${library.settings.theme === 'light'}">Светлая</button></div></div><label class="setting-row"><span class="setting-label">${icon('waves')}<span>Анимации<small>Живая волна и анимация интерфейса</small></span></span><input class="switch" id="animations" type="checkbox" ${library.settings.animations ? 'checked' : ''}/></label></section><section class="settings-group"><h2>Воспроизведение</h2><label class="setting-row crossfade-setting"><span class="setting-label">Плавный переход<small>Новый трек начинает звучать перед концом предыдущего</small></span><span class="crossfade-value"><input id="crossfade" type="range" min="0" max="8" step="1" value="${library.settings.crossfade}"><output for="crossfade">${library.settings.crossfade?`${library.settings.crossfade} с`:'Выкл.'}</output></span></label></section><section class="settings-group"><h2>Тексты песен</h2><div class="setting-row"><span class="setting-label">${icon('mic-2')}Сервис перевода</span><button class="secondary-button" data-action="translation-provider">${translationLabels[library.settings.translation]} ${icon('chevron-down')}</button></div><div class="setting-row"><span class="setting-label">Язык перевода</span><button class="secondary-button" data-action="translation-language">${e(languageName(library.settings.translationLanguage))} ${icon('chevron-down')}</button></div></section><section class="settings-group"><h2>Рекомендации</h2><div class="setting-row"><span class="setting-label">${icon('waves')}<span>Любимые исполнители<small>Помогите волне лучше узнать вас</small></span></span><button class="text-button" data-action="favorite-artists">Выбрать ${icon('chevron-right')}</button></div><div class="setting-row"><span class="setting-label">${icon('thumbs-down')}<span>Не рекомендовать</span></span><button class="text-button" data-action="blocked-tracks">Посмотреть список ${icon('chevron-right')}</button></div></section><section class="settings-group"><h2>Медиатека</h2><div class="setting-row"><span class="setting-label">${icon('library')}<span>Ваша коллекция<small>${library.likes.length} любимых · ${library.playlists.length} плейлистов</small></span></span><button class="text-button" data-action="export">Сохранить копию ${icon('download')}</button></div><div class="setting-row"><span class="setting-label">${icon('import')}<span>Перенос музыки</span></span><button class="text-button" data-action="import">Открыть ${icon('arrow-right')}</button></div></section><div class="settings-about">${icon('audio-lines')}<span><strong>YaMusic</strong><small>В вашем ритме · версия 0.1</small></span></div></div>`;
+  closeTranslationMenus?.();
+  main.innerHTML = `<div class="page-heading"><div><span class="eyebrow">ВАШЕ ПРОСТРАНСТВО</span><h1>Настройки</h1></div></div><div class="settings-content"><button class="profile-summary" data-action="account"><span class="profile-avatar" data-account-avatar>${accountAvatar()}</span><span><strong>${authUser?e(authUser.first_name||authUser.username||"Мой профиль"):"Мой профиль"}</strong><small>${authUser?"Telegram подключён":"Войти через Telegram"}</small></span>${icon('chevron-right')}</button><section class="settings-group"><h2>Оформление</h2><div class="setting-row"><div class="setting-label">${icon('palette')}<span>Тема</span></div><div class="segmented" role="group" aria-label="Цветовая тема"><button data-action="theme" data-theme="dark" class="${library.settings.theme === 'dark' ? 'selected' : ''}" aria-pressed="${library.settings.theme === 'dark'}">Тёмная</button><button data-action="theme" data-theme="light" class="${library.settings.theme === 'light' ? 'selected' : ''}" aria-pressed="${library.settings.theme === 'light'}">Светлая</button></div></div><label class="setting-row"><span class="setting-label">${icon('waves')}<span><span id="animations-label">Анимации</span><small id="animations-description">Живая волна и анимация интерфейса</small></span></span><span class="spring-switch"><input id="animations" type="checkbox" role="switch" aria-labelledby="animations-label" aria-describedby="animations-description" ${library.settings.animations ? 'checked' : ''}><span class="spring-switch-thumb" aria-hidden="true"></span></span></label></section><section class="settings-group"><h2>Воспроизведение</h2><label class="setting-row crossfade-setting"><span class="setting-label">Плавный переход<small>Новый трек начинает звучать перед концом предыдущего</small></span><span class="crossfade-value"><input id="crossfade" type="range" min="0" max="8" step="1" value="${library.settings.crossfade}"><output for="crossfade">${library.settings.crossfade?`${library.settings.crossfade} с`:'Выкл.'}</output></span></label></section><section class="settings-group"><h2>Тексты песен</h2><div class="setting-row"><span class="setting-label">${icon('mic-2')}Сервис перевода</span>${translationTrigger('translation-provider', 'Сервис перевода', translationLabels[library.settings.translation])}</div><div class="setting-row"><span class="setting-label">Язык перевода</span>${translationTrigger('translation-language', 'Язык перевода', languageName(library.settings.translationLanguage))}</div></section><section class="settings-group"><h2>Рекомендации</h2><div class="setting-row"><span class="setting-label">${icon('waves')}<span>Любимые исполнители<small>Помогите волне лучше узнать вас</small></span></span><button class="text-button" data-action="favorite-artists">Выбрать ${icon('chevron-right')}</button></div><div class="setting-row"><span class="setting-label">${icon('thumbs-down')}<span>Не рекомендовать</span></span><button class="text-button" data-action="blocked-tracks">Посмотреть список ${icon('chevron-right')}</button></div></section><section class="settings-group"><h2>Медиатека</h2><div class="setting-row"><span class="setting-label">${icon('library')}<span>Ваша коллекция<small>${library.likes.length} любимых · ${library.playlists.length} плейлистов</small></span></span><button class="text-button" data-action="export">Сохранить копию ${icon('download')}</button></div><div class="setting-row"><span class="setting-label">${icon('import')}<span>Перенос музыки</span></span><button class="text-button" data-action="import">Открыть ${icon('arrow-right')}</button></div></section><div class="settings-about">${icon('audio-lines')}<span><strong>YaMusic</strong><small>В вашем ритме · версия 0.1</small></span></div></div>`;
   hydrateIcons(main);
+  mountTranslationSettings();
+  mountSpringSwitch(main.querySelector<HTMLInputElement>('#animations')!);
 }
 
 async function detail(kind: string, id: string, gen: number): Promise<void> {
@@ -490,6 +508,7 @@ async function detail(kind: string, id: string, gen: number): Promise<void> {
 
 function navigate(): void {
   if(!authUser)return;
+  closeTranslationMenus?.(); closeTranslationMenus = undefined;
   closePlaylistMenu();closeSongActions();neuroRequest?.abort();currentPlaylist=undefined;playlistSuggestions=[];
   if(currentView==='search'&&searchResults)rememberCurrentSearch();
   generation++; searchRequest?.abort(); clearTimeout(searchTimer); wave?.destroy(); wave = undefined;
@@ -605,6 +624,7 @@ function celebrateWave(): void {
   if (currentView === 'home' && player.context) wave?.celebrate();
 }
 function showDialog(title: string, content: string, cls = ''): void {
+  closeTranslationMenus?.();
   closeSongActions(); closePlaylistMenu(); closeQueue();
   fullPlayerClosing?.cancel();
   fullPlayerClosing = undefined;
@@ -646,6 +666,7 @@ function renderSession(): void {
   }
   if(dialog.open)dialog.close();
   closeQueue(); closePlaylistMenu(); closeSongActions();
+  closeTranslationMenus?.(); closeTranslationMenus = undefined;
   wave?.destroy(); wave=undefined;
   generation++; searchRequest?.abort(); neuroRequest?.abort();
   main.replaceChildren();
@@ -844,6 +865,7 @@ function positionTrackPopover(panel: HTMLElement, trigger: HTMLElement | undefin
   if (anchor.bottom < 0 || anchor.top > window.innerHeight) { close(); return; }
   const above = anchor.top - 18, below = window.innerHeight - anchor.bottom - 18;
   const useAbove = above >= Math.min(360,panel.scrollHeight) || above >= below;
+  panel.dataset.side = useAbove ? 'above' : 'below';
   panel.style.maxHeight = `${Math.max(72,Math.min(360,useAbove ? above : below))}px`;
   const width = panel.offsetWidth, height = panel.offsetHeight;
   panel.style.left = `${Math.max(10,Math.min(window.innerWidth - width - 10,anchor.right - width))}px`;
@@ -873,6 +895,7 @@ function openPlaylistMenu(trigger: HTMLElement, track: Track): void {
   playlistMenu.showPopover();
   positionPlaylistMenu();
   playlistMenu.querySelector<HTMLElement>('input,button:not(:disabled)')?.focus({preventScroll:true});
+  animateDropdown(playlistMenu, [...playlistMenu.querySelectorAll<HTMLElement>('.playlist-menu-list button')]);
 }
 
 function addPlaylistTrack(playlist: Playlist, track: Track): boolean {
@@ -1437,6 +1460,7 @@ function trackMenu(trigger: HTMLElement, id: string): void {
   songActions.showPopover();
   positionSongActions();
   songActions.querySelector<HTMLElement>('button')?.focus({preventScroll:true});
+  animateDropdown(songActions, [...songActions.querySelectorAll<HTMLElement>('.action-list > *')]);
 }
 
 document.addEventListener('click', async event => {
@@ -1558,13 +1582,6 @@ document.addEventListener('click', async event => {
   }
   else if (action === 'import-playlist' || action === 'import-likes') saveImport(action==='import-likes');
   else if (action === 'translation') void toggleTranslation(target as HTMLButtonElement);
-  else if (action === 'translation-provider' || action === 'translation-language') openTranslationSettings(action);
-  else if (action === 'choose-translation-provider' || action === 'choose-translation-language') {
-    if(action==='choose-translation-provider'&&Object.hasOwn(translationLabels,id))library.settings.translation=id as TranslationProvider;
-    else if(languageCodes.includes(id))library.settings.translationLanguage=id;
-    save();dialog.close();settings();
-    main.querySelector<HTMLElement>(`[data-action="${action.replace('choose-','')}"]`)?.focus({preventScroll:true});
-  }
   else if (action === 'lyrics-view') {
     const shown=dialog.classList.toggle('show-lyrics');
     target.setAttribute('aria-pressed',String(shown)); target.classList.toggle('selected',shown);
@@ -1679,12 +1696,6 @@ document.addEventListener('input', event => {
     player.setCrossfade(seconds);
     input.parentElement!.querySelector('output')!.textContent=seconds?`${seconds} с`:'Выкл.';
     fillRange(input);save();
-  }
-  else if(input.id==='language-filter'){
-    const query=input.value.trim().toLocaleLowerCase('ru');
-    dialog.querySelectorAll<HTMLButtonElement>('[data-action="choose-translation-language"]').forEach(option=>{
-      option.hidden=!option.textContent?.toLocaleLowerCase('ru').includes(query)&&!option.dataset.id?.startsWith(query);
-    });
   }
   else if (input.matches('[data-volume]')) { player.setVolume(Number(input.value)); library.settings.volume = player.volume; save(); fillRange(input); }
   else if (input.matches('[data-seek]')) { player.seek(Number(input.value)); fillRange(input); }
