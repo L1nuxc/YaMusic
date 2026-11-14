@@ -7,6 +7,8 @@ const fade = springFrames(400, 34, 500);
 const rowSpring = springFrames(300, 24, 400);
 const roll = springFrames(340, 26, 400);
 const chevron = springFrames(300, 18, 500);
+const press = springFrames(500, 18, 400);
+const check = springFrames(260, 26, 400);
 const leadingEdge = springFrames(620, 36, 400);
 const trailingEdge = springFrames(200, 20, 400);
 
@@ -18,11 +20,12 @@ export function animateDropdown(panel: HTMLElement, rows: HTMLElement[], opens =
     const inset = `${100 * (1 - unit(progress))}%`;
     return {
       clipPath: edge === 'top' ? `inset(${inset} 0 0 round var(--small-radius))` : `inset(0 0 ${inset} round var(--small-radius))`,
-      transform: `scaleX(${0.9 + 0.1 * progress})`,
+      transformOrigin: edge === 'top' ? 'center bottom' : 'center top',
+      transform: `scale(${0.9 + 0.1 * progress}, ${Math.max(1, progress)})`,
       opacity: unit(opens ? fade[i] : 1 - fade[i]),
     };
   });
-  const animation = panel.animate(frames, { duration: opens ? 500 : 300, fill: opens ? 'none' : 'forwards' });
+  const animation = panel.animate(frames, { duration: 500, fill: opens ? 'none' : 'forwards' });
   if (opens) {
     const visible = panel.getBoundingClientRect();
     rows.filter(row => {
@@ -48,6 +51,7 @@ export function mountSpringSelect(
   let panelAnimation: Animation | undefined;
   let indicatorAnimation: Animation | undefined;
   let highlightAnimation: Animation | undefined;
+  let triggerAnimation: Animation | undefined;
   const value = trigger.querySelector<HTMLElement>('.spring-select-value')!;
   const arrow = trigger.querySelector<SVGElement>('svg')!;
   const panel = document.createElement('div');
@@ -169,7 +173,20 @@ export function mountSpringSelect(
     }, { signal });
   }
 
-  trigger.addEventListener('click', () => listeners ? close(true) : open());
+  function pressTrigger(scale: number): void {
+    triggerAnimation?.cancel();
+    if (interfaceMotion()) {
+      triggerAnimation = trigger.animate(press.map(progress => ({
+        scale: String(scale + (1 - scale) * progress),
+      })), 400);
+    }
+  }
+
+  trigger.addEventListener('click', () => {
+    if (listeners) close(true);
+    else open();
+    pressTrigger(0.965);
+  });
   trigger.addEventListener('keydown', event => {
     if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
     event.preventDefault();
@@ -186,6 +203,16 @@ export function mountSpringSelect(
     const enabled = rows.filter(row => !row.hidden && !row.disabled);
     if (!enabled.length) return;
     const index = enabled.indexOf(document.activeElement as HTMLButtonElement);
+    if ((event.key === 'Enter' || event.key === ' ') && index >= 0) {
+      event.preventDefault();
+      if (!event.repeat) enabled[index].click();
+      return;
+    }
+    if (event.key === 'Enter' && event.target === filter && enabled.length === 1) {
+      event.preventDefault();
+      enabled[0].click();
+      return;
+    }
     let next: HTMLButtonElement;
     if (event.key === 'ArrowDown') next = enabled[Math.min(enabled.length - 1, index + 1)];
     else if (event.key === 'ArrowUp') next = index < 0 ? enabled.at(-1)! : enabled[Math.max(0, index - 1)];
@@ -212,6 +239,7 @@ export function mountSpringSelect(
     row.addEventListener('pointerenter', () => { if (!row.disabled) pointAt(row); });
     row.addEventListener('focus', () => pointAt(row));
     row.addEventListener('click', () => {
+      pressTrigger(0.955);
       const next = row.dataset.value!;
       if (next !== selected) {
         const old = value.textContent!;
@@ -222,6 +250,11 @@ export function mountSpringSelect(
         onSelect(next);
         valueAnimations.forEach(animation => animation.cancel());
         if (interfaceMotion()) {
+          const tick = row.querySelector<SVGElement>('svg :is(path, polyline)');
+          tick?.animate(check.map(progress => ({
+            strokeDasharray: '22',
+            strokeDashoffset: String(22 * (1 - unit(progress))),
+          })), 400);
           const leaving = document.createElement('span');
           leaving.className = 'spring-select-old';
           leaving.setAttribute('aria-hidden', 'true');
