@@ -11,7 +11,7 @@
 .chosen-artists .chip { display:flex;align-items:center;gap:7px; }
 .chosen-artists .icon { width:13px;height:13px; }
 .artist-picker-grid { display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:22px 16px; }
-.artist-picker-related { margin: 0 0 24px; padding: 16px; border-radius: 22px; background: var(--glass); }
+.artist-picker-related { margin: 0 0 24px; padding: 16px; border-radius: 22px; background: var(--panel); }
 .artist-picker-related h3 { font-size: 14px; text-align: center; }
 .artist-picker-related p { text-align: center; margin-top: 8px; font-size: 12px; }
 .artist-neighborhood { display: grid; grid-template: repeat(3, minmax(62px, auto)) / repeat(3, minmax(0, 1fr)); gap: 12px 8px; max-width: 450px; margin: 12px auto 0; align-items: start; }
@@ -54,7 +54,7 @@
 .playlist-editor .field-label { margin:8px 0 0; }
 .playlist-editor textarea { resize:none;min-height:88px;overflow:hidden;font:inherit; }
 .playlist-cover-editor { display:flex;gap:18px;align-items:center; }
-.playlist-cover-preview { position:relative;width:96px;height:96px;padding:0;flex:none;display:grid;place-items:center;background:var(--glass);border:1px solid var(--line);border-radius:22px;overflow:hidden; }
+.playlist-cover-preview { position:relative;width:96px;height:96px;padding:0;flex:none;display:grid;place-items:center;background:var(--panel);border:1px solid var(--line);border-radius:22px;overflow:hidden; }
 .playlist-cover-preview > [data-cover-image] { width:100%;height:100%;display:grid;place-items:center; }
 .playlist-cover-preview img { width:100%;height:100%;object-fit:cover; }
 .playlist-cover-badge { position:absolute;right:6px;bottom:6px;display:grid;place-items:center;width:24px;height:24px;border-radius:50%;background:var(--accent);color:var(--accent-ink); }
@@ -63,7 +63,7 @@
 .playlist-header > :last-child { min-width:0; }
 .playlist-header h1 { overflow-wrap:anywhere; }
 .playlist-discovery-columns { display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px; }
-.playlist-discovery-columns > section { min-width:0;padding:14px;border-radius:20px;background:var(--glass); }
+.playlist-discovery-columns > section { min-width:0;padding:14px;border-radius:20px;background:var(--panel); }
 .playlist-discovery-columns h3 { margin:4px 4px 10px;font-size:14px; }
 .playlist-discovery-columns .muted { margin:8px 4px;font-size:12px; }
 .playlist-discovery-columns [data-playlist-likes], .playlist-discovery-columns [data-playlist-suggestions] { max-height:390px;overflow:auto; }
@@ -166,12 +166,11 @@ button.compact-track:hover:not(:disabled),.compact-track.current { background:va
 .tab-pill {
   position:absolute; top:0; left:0; width:0; height:100%; pointer-events:none;
   border-radius:var(--radius); background:var(--active);
-  box-shadow:inset 0 1px 1px #ffffff26;
 }
 .desktop-navigation .tab-pill { width:100%; height:0; }
 .filter-row > .tab-pill-group {
   display:inline-flex; max-width:100%; flex:none; gap:3px; padding:3px;
-  border-radius:var(--radius); background:var(--glass); border:1px solid var(--line);
+  border-radius:var(--radius); background:var(--panel); border:1px solid var(--line);
 }
 .filter-row > .tab-pill-group > .chip { border-color:transparent; background:transparent; }
 .filter-row > .tab-pill-group > .tab-pill,.segmented > .tab-pill { top:3px; height:calc(100% - 6px); }

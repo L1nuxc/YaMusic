@@ -183,7 +183,6 @@ export class Player extends EventTarget {
       if (sequence !== this.sequence) return;
       this.palette = palette;
       document.documentElement.style.setProperty('--cover-color', `rgb(${palette.primary.join(' ')})`);
-      document.documentElement.style.setProperty('--cover-secondary', `rgb(${palette.secondary.join(' ')})`);
       this.dispatchEvent(new Event('palettechange'));
     });
     if ('mediaSession' in navigator && 'MediaMetadata' in window) {

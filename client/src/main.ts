@@ -15,6 +15,8 @@ import { parseSpotifyExport, type SpotifyExportPlaylist } from './spotify-export
 import { animateDropdown, mountSpringSelect, mountSpringSwitch } from './spring-controls.ts';
 import { jellySlider, mountJellySlider } from './jelly-slider.ts';
 import { mountPillGroups, selectPillButton, syncTabPill } from './tab-pill.ts';
+import { mountPlayerRanges, playerRange } from './player-range.ts';
+import { mountCoverParallax } from './cover-parallax.ts';
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
 const dialog = document.querySelector<HTMLDialogElement>('#dialog')!;
@@ -565,10 +567,18 @@ function navigateBack(): void {
   go(['playlist','history','settings'].includes(currentView)?'library':['album','artist'].includes(currentView)?'search':'home');
 }
 
+function volumeControl(): string {
+  return `<div class="volume-group">
+    <button class="icon-button mute-button" data-action="mute" aria-label="Выключить звук">${icon('volume-2')}</button>
+    ${playerRange('volume', player.volume, 1)}
+  </div>`;
+}
+
 function renderPlayer(): void {
   const t = player.current;
   playerBar.classList.toggle('has-track', !!t);
-  playerBar.innerHTML = `<div class="player-information"><button class="player-art" data-action="expand" ${t ? '' : 'disabled'} aria-label="Открыть плеер">${t ? image(t.cover_url, '', '', true) : icon('disc-3')}</button><div class="player-track-name">${t ? `<button class="player-name-link" data-action="expand"><span class="moving-title-text">${e(t.title)}</span></button><span class="mobile-track-artist">${e(trackArtists(t).map(a=>a.name).join(', '))}</span>${artistLinks(t, "player-artist-link")}` : '<strong>С чего начнём?</strong><span>Найдите музыку по настроению</span>'}</div><button class="icon-button like-button player-like" data-action="like-current" aria-label="В любимое" ${t ? '' : 'disabled'}>${icon('heart')}</button>${t ? button('add-playlist-menu','plus','Добавить в плейлист',`data-id="${e(t.id)}" aria-expanded="false" aria-controls="playlist-menu" data-player-add`) : ''}</div><div class="player-transport"><div class="transport-buttons"><button class="icon-button shuffle-button" data-action="shuffle" aria-label="Перемешать" aria-pressed="${player.shuffle}">${icon('shuffle')}</button>${button('previous','skip-back','Предыдущий трек')}<button class="transport-play" data-action="toggle" aria-label="Воспроизвести">${icon('play')}</button>${button('next','skip-forward','Следующий трек')}<button class="icon-button repeat-button" data-action="repeat" aria-label="Повтор выключен">${icon('repeat')}</button></div><div class="player-timeline"><span data-elapsed>0:00</span><input type="range" data-seek min="0" max="${player.duration}" step="0.1" value="0" aria-label="Позиция в треке" ${t ? '' : 'disabled'}/><span data-duration>${formatTime(player.duration)}</span></div></div><div class="player-end"><div class="volume-group"><button class="icon-button mute-button" data-action="mute" aria-label="Выключить звук">${icon('volume-2')}</button><input type="range" data-volume min="0" max="1" step="0.01" value="${player.volume}" aria-label="Громкость"/></div><div class="player-extras">${button('lyrics','mic-2','Текст песни')}${button('queue','list-music','Очередь','aria-controls="playback-queue" aria-expanded="false"')}</div></div><div class="mobile-player-actions"><button class="icon-button" data-action="toggle" aria-label="Воспроизвести" data-mobile-play>${icon('play')}</button></div><div class="mobile-progress"><span></span></div>`;
+  playerBar.innerHTML = `<div class="player-information"><button class="player-art" data-action="expand" ${t ? '' : 'disabled'} aria-label="Открыть плеер">${t ? image(t.cover_url, '', '', true) : icon('disc-3')}</button><div class="player-track-name">${t ? `<button class="player-name-link" data-action="expand"><span class="moving-title-text">${e(t.title)}</span></button><span class="mobile-track-artist">${e(trackArtists(t).map(a=>a.name).join(', '))}</span>${artistLinks(t, "player-artist-link")}` : '<strong>С чего начнём?</strong><span>Найдите музыку по настроению</span>'}</div><button class="icon-button like-button player-like" data-action="like-current" aria-label="В любимое" ${t ? '' : 'disabled'}>${icon('heart')}</button>${t ? button('add-playlist-menu','plus','Добавить в плейлист',`data-id="${e(t.id)}" aria-expanded="false" aria-controls="playlist-menu" data-player-add`) : ''}</div><div class="player-transport"><div class="transport-buttons"><button class="icon-button shuffle-button" data-action="shuffle" aria-label="Перемешать" aria-pressed="${player.shuffle}">${icon('shuffle')}</button>${button('previous','skip-back','Предыдущий трек')}<button class="transport-play" data-action="toggle" aria-label="Воспроизвести">${icon('play')}</button>${button('next','skip-forward','Следующий трек')}<button class="icon-button repeat-button" data-action="repeat" aria-label="Повтор выключен">${icon('repeat')}</button></div><div class="player-timeline"><span data-elapsed>0:00</span>${playerRange('seek', player.time, player.duration, !t)}<span data-duration>${formatTime(player.duration)}</span></div></div><div class="player-end">${volumeControl()}<div class="player-extras">${button('lyrics','mic-2','Текст песни')}${button('queue','list-music','Очередь','aria-controls="playback-queue" aria-expanded="false"')}</div></div><div class="mobile-player-actions"><button class="icon-button" data-action="toggle" aria-label="Воспроизвести" data-mobile-play>${icon('play')}</button></div><div class="mobile-progress">${playerRange('seek', player.time, player.duration, !t)}</div>`;
+  mountPlayerRanges(playerBar);
   if(playlistMenuTrigger&&!playlistMenuTrigger.isConnected)closePlaylistMenu();
   updatePlayerControls(); updateQueueButtons(); hydrateIcons(playerBar); updateProgress();
 }
@@ -592,22 +602,33 @@ function updatePlayerControls(): void {
   });
   renderQueue();
   document.querySelectorAll<HTMLElement>('.repeat-button').forEach(el=> { el.classList.toggle('active',player.repeat !== 'off'); el.setAttribute('aria-label', `Повтор: ${player.repeat === 'one' ? 'одна песня' : player.repeat === 'all' ? 'вся очередь' : 'выключен'}`); replaceIcon(el, player.repeat === 'one' ? 'repeat-1' : 'repeat'); });
-  document.querySelectorAll<HTMLElement>('.mute-button').forEach(el => replaceIcon(el, player.volume === 0 ? 'volume-x' : 'volume-2'));
-  document.querySelectorAll<HTMLInputElement>('[data-volume]').forEach(el => { if (el !== document.activeElement) el.value = String(player.volume); fillRange(el); });
+  document.querySelectorAll<HTMLElement>('.mute-button').forEach(el => {
+    const muted = player.volume === 0;
+    const label = muted ? 'Включить звук' : 'Выключить звук';
+    el.setAttribute('aria-label', label);
+    el.title = label;
+    replaceIcon(el, muted ? 'volume-x' : 'volume-2');
+  });
+  document.querySelectorAll<HTMLInputElement>('[data-volume]').forEach(el => { el.value = String(player.volume); fillRange(el); });
   document.querySelectorAll<HTMLElement>('.wave-play').forEach(el => {replaceIcon(el, player.context&&player.playing?'pause':'play');el.setAttribute('aria-label',player.context&&player.playing?'Пауза Моей волны':'Включить Мою волну');});
   document.querySelectorAll<HTMLElement>('[data-track-row]').forEach(el=>el.classList.toggle('current-track',el.dataset.trackRow === t?.id));
   updateLikes();
 }
 function fillRange(el: HTMLInputElement): void {
-  const min = Number(el.min) || 0, max = Number(el.max) || 1;
-  el.style.setProperty('--range-fill', `${Math.max(0, Math.min(100, (Number(el.value) - min) / (max - min) * 100))}%`);
+  const max = Number(el.max);
+  const fill = max > 0 ? Math.max(0, Math.min(100, Number(el.value) / max * 100)) : 0;
+  el.style.setProperty('--range-fill', `${fill}%`);
+  el.setAttribute('aria-valuetext', el.hasAttribute('data-volume') ? `${Math.round(Number(el.value) * 100)}%` : formatTime(Number(el.value)));
 }
 function updateProgress(): void {
   updateLyrics();
-  document.querySelectorAll<HTMLInputElement>('[data-seek]').forEach(el => { el.max = String(player.duration); if (el !== document.activeElement) el.value = String(player.time); fillRange(el); });
+  document.querySelectorAll<HTMLInputElement>('[data-seek]').forEach(el => {
+    el.max = String(player.duration);
+    el.value = String(player.time);
+    fillRange(el);
+  });
   document.querySelectorAll('[data-elapsed]').forEach(el => el.textContent = formatTime(player.time));
   document.querySelectorAll('[data-duration]').forEach(el => el.textContent = formatTime(player.duration));
-  document.querySelector<HTMLElement>('.mobile-progress span')?.style.setProperty('width', `${player.duration ? player.time / player.duration * 100 : 0}%`);
 }
 function updateLikes(): void {
   document.querySelectorAll<HTMLElement>('.like-button').forEach(el => {
@@ -1010,13 +1031,17 @@ function fullPlayer(lyrics = false): void {
     <div class="expanded-player">
       <div class="expanded-deck">
         <div class="expanded-artwork">
-          <div class="expanded-cover-frame">${image(t.cover_url,'','expanded-cover',true)}</div>
-          <div class="expanded-track">
-            <div class="expanded-metadata">
-              <h1><a href="#/album/${t.album_id}" data-action="album" data-id="${t.album_id}"><span class="moving-title-text">${e(t.title)}</span></a></h1>
-              ${artistLinks(t, 'expanded-artist-link')}
-              <span class="preview-note" role="status" data-playback-label></span>
+          <div class="expanded-cover-frame">
+            <div class="expanded-cover-card">
+              <div class="expanded-cover-art">${image(t.cover_url,'','expanded-cover',true)}</div>
+              <div class="expanded-metadata">
+                <h1><a href="#/album/${t.album_id}" data-action="album" data-id="${t.album_id}"><span class="moving-title-text">${e(t.title)}</span></a></h1>
+                ${artistLinks(t, 'expanded-artist-link')}
+                <span class="preview-note" role="status" data-playback-label></span>
+              </div>
             </div>
+          </div>
+          <div class="expanded-track">
             <div class="expanded-actions">
               <button class="icon-button like-button" data-action="like-current" aria-label="В любимое">${icon('heart')}</button>
               ${button('add-playlist-menu','plus','Добавить в плейлист',`data-id="${e(t.id)}" aria-expanded="false" aria-controls="playlist-menu"`)}
@@ -1028,7 +1053,7 @@ function fullPlayer(lyrics = false): void {
         <div class="expanded-transport">
           <div class="expanded-timeline">
             <span data-elapsed>${formatTime(player.time)}</span>
-            <input type="range" data-seek min="0" max="${player.duration}" step="0.1" value="${player.time}" aria-label="Позиция в треке"/>
+            ${playerRange('seek', player.time, player.duration)}
             <span data-duration>${formatTime(player.duration)}</span>
           </div>
           <div class="transport-buttons">
@@ -1039,10 +1064,13 @@ function fullPlayer(lyrics = false): void {
             <button class="icon-button repeat-button" data-action="repeat" aria-label="Повтор">${icon('repeat')}</button>
           </div>
         </div>
-        <div class="lyrics-tabs">
-          <span class="chip selected desktop-lyrics-tab">Текст песни</span>
-          <button class="chip lyrics-view-toggle${lyrics ? ' selected' : ''}" data-action="lyrics-view" aria-pressed="${lyrics}">Текст песни</button>
-          <button class="chip" data-action="translation" aria-pressed="false" disabled>Перевод</button>
+        <div class="expanded-options">
+          <div class="lyrics-tabs">
+            <span class="chip selected desktop-lyrics-tab">Текст песни</span>
+            <button class="chip lyrics-view-toggle${lyrics ? ' selected' : ''}" data-action="lyrics-view" aria-pressed="${lyrics}">Текст песни</button>
+            <button class="chip" data-action="translation" aria-pressed="false" disabled>Перевод</button>
+          </div>
+          ${volumeControl()}
         </div>
         <p class="translation-status" role="status" hidden></p>
       </div>
@@ -1058,26 +1086,11 @@ function fullPlayer(lyrics = false): void {
     </div>`;
   dialog.setAttribute('aria-label', 'Полноэкранный плеер');
   if (!alreadyOpen) dialog.showModal();
-  bindCoverTilt(dialog.querySelector<HTMLElement>('.expanded-cover-frame')!);
+  mountCoverParallax(dialog.querySelector<HTMLElement>('.expanded-cover-frame')!);
+  mountPlayerRanges(dialog);
   updatePlayerControls(); updateProgress(); hydrateIcons(dialog); void loadLyrics();
 }
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
-function bindCoverTilt(frame: HTMLElement): void {
-  const reset = () => frame.classList.remove('tilting');
-  frame.addEventListener('pointermove',event=>{
-    if(event.pointerType!=='mouse' || reducedMotion.matches || !library.settings.animations) return;
-    const bounds=frame.getBoundingClientRect();
-    const x=Math.max(-1,Math.min(1,(event.clientX-bounds.left)/bounds.width*2-1));
-    const y=Math.max(-1,Math.min(1,(event.clientY-bounds.top)/bounds.height*2-1));
-    frame.style.setProperty('--cover-rx',`${y*7}deg`);
-    frame.style.setProperty('--cover-ry',`${-x*7}deg`);
-    frame.style.setProperty('--cover-x',`${(x+1)*50}%`);
-    frame.style.setProperty('--cover-y',`${(y+1)*50}%`);
-    frame.classList.add('tilting');
-  });
-  frame.addEventListener('pointerleave',reset);
-  frame.addEventListener('pointercancel',reset);
-}
 
 const titleSelector='.track-name,.player-name-link,.expanded-metadata h1 a';
 const titleAnimations=new WeakMap<HTMLElement,Animation>();
@@ -1798,10 +1811,6 @@ dialog.addEventListener('click', event => {
 });
 function adjustVolume(direction:number):void {
   player.setVolume(Math.round((player.volume+direction*.05)*100)/100);
-  const focused=document.activeElement;
-  if(focused instanceof HTMLInputElement&&focused.matches('[data-volume]')){
-    focused.value=String(player.volume);fillRange(focused);
-  }
   library.settings.volume=player.volume;
   save();
 }
@@ -1809,6 +1818,7 @@ let playerSwipe: {id:number;x:number;y:number} | undefined;
 let suppressPlayerClick = 0;
 playerBar.addEventListener('pointerdown',event=>{
   if(!useMobilePlayer.matches||event.pointerType==='mouse'||!event.isPrimary||!player.current)return;
+  if ((event.target as Element).closest('.player-range')) return;
   playerSwipe={id:event.pointerId,x:event.clientX,y:event.clientY};
 });
 window.addEventListener('pointercancel',event=>{if(playerSwipe?.id===event.pointerId)playerSwipe=undefined;});
@@ -1827,7 +1837,7 @@ playerBar.addEventListener('click',event=>{
   if(!player.current||(event.target as Element).closest('button,a,input'))return;
   fullPlayer();
 });
-playerBar.addEventListener('wheel',event=>{
+document.addEventListener('wheel',event=>{
   if(event.ctrlKey||!event.deltaY||!(event.target as HTMLElement).closest('.volume-group'))return;
   event.preventDefault();adjustVolume(event.deltaY<0?1:-1);
 },{passive:false});
@@ -1847,7 +1857,7 @@ document.addEventListener('keydown', event => {
     event.preventDefault();adjustVolume(event.key === 'ArrowUp' ? 1 : -1);
   }
 });
-// Drag the floating glass lens; release selects the tab underneath it.
+// Drag the highlight to select a tab on release.
 let navPointer: number | undefined;
 let navStartX = 0;
 let suppressNavClickUntil = 0;
