@@ -297,12 +297,12 @@ kbd { background: rgba(128,128,128,.1); padding: 3px 7px; border-radius: 6px; fo
 .player-timeline { display: flex; align-items: center; gap: 8px; min-height: 18px; }
 .player-timeline .player-range, .expanded-timeline .player-range { flex: 1; }
 .player-timeline > span { font-size: 10px; color: var(--soft); font-variant-numeric: tabular-nums; white-space: nowrap; }
-input[type='range'] { --range-buffer: color-mix(in srgb, var(--text) 26%, var(--range-track)); appearance: none; -webkit-appearance: none; width: 100%; padding: 0; margin: 0; height: 22px; background: transparent; cursor: pointer; --range-fill: 0%; }
+input[type='range'] { appearance: none; -webkit-appearance: none; width: 100%; padding: 0; margin: 0; height: 22px; background: transparent; cursor: pointer; --range-fill: 0%; }
 .player-range { position: relative; min-width: 0; }
 .player-range input { --range-thumb-size: 7px; --range-height: 2px; display: block; touch-action: none; }
 .player-range input:disabled { cursor: default; opacity: .5; }
-.player-range input::-webkit-slider-runnable-track { height: var(--range-height); border-radius: 10px; background: linear-gradient(to right,var(--text) 0 var(--range-fill),transparent var(--range-fill) 100%), var(--range-buffer-background, var(--range-track)); }
-.player-range input::-moz-range-track { height: var(--range-height); border-radius: 10px; background: var(--range-buffer-background, var(--range-track)); }
+.player-range input::-webkit-slider-runnable-track { height: var(--range-height); border-radius: 10px; background: linear-gradient(to right,var(--text) 0 var(--range-fill),var(--range-track) var(--range-fill) 100%); }
+.player-range input::-moz-range-track { height: var(--range-height); border-radius: 10px; background: var(--range-track); }
 .player-range input::-moz-range-progress { background: var(--text); height: var(--range-height); border-radius: 10px; }
 .player-range input::-webkit-slider-thumb { appearance: none; width: var(--range-thumb-size); height: var(--range-thumb-size); margin-top: calc((var(--range-height) - var(--range-thumb-size)) / 2); background: var(--text); border-radius: 50%; }
 .player-range input::-moz-range-thumb { width: var(--range-thumb-size); height: var(--range-thumb-size); background: var(--text); border: 0; border-radius: 50%; }

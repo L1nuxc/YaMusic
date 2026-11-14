@@ -7,10 +7,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{SqlitePool, Row};
 use std::{collections::{HashMap,HashSet,VecDeque}, path::PathBuf, process::Stdio, sync::{Arc, Weak, Mutex as StdMutex, atomic::{AtomicUsize, Ordering}}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, process::Command, sync::{Mutex, Notify, Semaphore}};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, process::Command, sync::{Mutex, Notify, Semaphore, watch}};
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 
+const INITIAL_BUFFER_SECONDS: f64 = 33.0;
 const START_BUFFER: u64 = 256 * 1024;
 const STREAM_WINDOW: u64 = 1024 * 1024;
 const MAX_FILE: u64 = 80 * 1024 * 1024;
@@ -26,7 +27,34 @@ pub struct Candidate {
     pub content_type: String, pub byte_len: u64,
     #[serde(default)] pub segmented: bool,
     #[serde(default)] segments: Vec<String>,
+    #[serde(default)] segment_durations: Vec<f64>,
 }
+impl Candidate {
+    fn has_segment_timing(&self) -> bool {
+        self.segments.len() >= 2 && self.segment_durations.len() + 1 == self.segments.len()
+    }
+
+    fn initial_segments(&self) -> usize {
+        let mut seconds = 0.0;
+        self.segment_durations.iter().take_while(|duration| {
+            let include = seconds < INITIAL_BUFFER_SECONDS;
+            seconds += **duration;
+            include
+        }).count()
+    }
+}
+
+struct BufferGate {
+    touched: Instant,
+    resume: watch::Sender<bool>,
+}
+
+async fn wait_for_buffer(gate: Option<watch::Receiver<bool>>) {
+    if let Some(mut gate) = gate {
+        let _ = gate.wait_for(|ready| *ready).await;
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct PlaybackInfo {
     pub mode: String, pub source: String, pub duration_sec: f64,
@@ -39,6 +67,7 @@ pub struct AudioService {
     locks: Locks, cache_io: Mutex<()>, active: Active,
     prefetch: Arc<PrefetchQueue>,
     youtube_blocked_until: Mutex<Option<Instant>>,
+    buffers: StdMutex<HashMap<(String, String), BufferGate>>,
 }
 #[derive(Default)]
 struct PrefetchQueue {
@@ -77,6 +106,7 @@ impl AudioService {
             workers:Semaphore::new(foreground_workers),background_workers:Semaphore::new(background_workers),foreground:AtomicUsize::new(0),resolutions:Mutex::new(HashMap::new()),locks:Mutex::new(HashMap::new()),cache_io:Mutex::new(()),active:Arc::new(StdMutex::new(HashMap::new())),
             prefetch: prefetch.clone(),
             youtube_blocked_until: Mutex::new(None),
+            buffers: StdMutex::new(HashMap::new()),
         });
         for _ in 0..background_workers {
             let weak = Arc::downgrade(&service);
@@ -172,6 +202,34 @@ impl AudioService {
         if let Some(c)=self.resolve(t).await? {Ok(PlaybackInfo{mode:"full".into(),source:c.source,duration_sec:c.duration,cached:false,uncensored_score:c.score,uncensored_confirmed:false})}
         else {Err(ApiError::full_audio_unavailable())}
     }
+    fn buffer_gate(&self, id: &str, token: &str, continued: bool) -> Option<watch::Receiver<bool>> {
+        if !valid_id(id) || token.len() != 36 || !token.bytes().all(|byte| byte.is_ascii_hexdigit() || byte == b'-') {
+            return None;
+        }
+        let mut buffers = self.buffers.lock().ok()?;
+        buffers.retain(|_, gate| gate.resume.receiver_count() > 0 || gate.touched.elapsed() < Duration::from_secs(1800));
+        let key = (id.to_owned(), token.to_owned());
+        if buffers.len() >= 2048 && !buffers.contains_key(&key) {
+            let oldest = buffers.iter().filter(|(_, gate)| gate.resume.receiver_count() == 0)
+                .min_by_key(|(_, gate)| gate.touched).map(|(key, _)| key.clone());
+            buffers.remove(&oldest?);
+        }
+        let gate = buffers.entry(key).or_insert_with(|| BufferGate {
+            touched: Instant::now(),
+            resume: watch::channel(false).0,
+        });
+        gate.touched = Instant::now();
+        if continued { gate.resume.send_replace(true); }
+        Some(gate.resume.subscribe())
+    }
+    pub fn continue_stream(&self, id: &str, token: &str) -> Result<(), ApiError> {
+        self.buffer_gate(id, token, true).ok_or_else(|| ApiError::bad_request("Некорректный буфер воспроизведения."))?;
+        Ok(())
+    }
+    fn requested_gate(&self, id: &str, request: &Request<Body>) -> Option<watch::Receiver<bool>> {
+        let token = request.uri().query()?.split('&').find_map(|part| part.strip_prefix("buffer="))?;
+        self.buffer_gate(id, token, false)
+    }
     pub fn has_foreground_work(&self)->bool {self.foreground.load(Ordering::Relaxed)>0}
     pub async fn resolve(&self,t:&Track)->Result<Option<Candidate>,ApiError> {self.resolve_priority(t,false).await}
     async fn resolve_priority(&self,t:&Track,background:bool)->Result<Option<Candidate>,ApiError> {
@@ -181,12 +239,12 @@ impl AudioService {
         let _guard=mutex.lock().await;
         {
             let map=self.resolutions.lock().await;
-            if let Some((at,result))=map.get(&t.id){if at.elapsed()<Duration::from_secs(600)&&result.as_ref().is_some_and(|c|(!c.segmented||!c.segments.is_empty())&&candidate_unexpired(c)){return Ok(result.clone());}}
+            if let Some((at,result))=map.get(&t.id){if at.elapsed()<Duration::from_secs(600)&&result.as_ref().is_some_and(|c|(!c.segmented||c.has_segment_timing())&&candidate_unexpired(c)){return Ok(result.clone());}}
         }
         let row=sqlx::query("SELECT candidate_json,expires_at FROM audio_resolutions WHERE track_id=?").bind(&t.id).fetch_optional(&self.db).await?;
         let previous=row.as_ref().and_then(|r|serde_json::from_str::<Candidate>(r.get::<&str,_>("candidate_json")).ok()).filter(|c|version_matches(&c.title,&t.title,&t.artist));
         if row.as_ref().is_some_and(|r|r.get::<i64,_>("expires_at")>now_seconds() as i64) {
-            if let Some(c)=previous.as_ref().filter(|c|candidate_unexpired(c) && (!c.segmented||!c.segments.is_empty())){self.remember(&t.id,Some(c.clone())).await;return Ok(Some(c.clone()));}
+            if let Some(c)=previous.as_ref().filter(|c|candidate_unexpired(c) && (!c.segmented||c.has_segment_timing())){self.remember(&t.id,Some(c.clone())).await;return Ok(Some(c.clone()));}
         }
         let query=format!("{} {}",t.artist,t.title);
         let search=async {
@@ -232,7 +290,7 @@ impl AudioService {
             tokio::time::sleep(Duration::from_millis(100)).await;
             let result=self.resolutions.lock().await.get(id).filter(|(at,c)|at.elapsed()<Duration::from_secs(600)&&c.as_ref().is_some_and(candidate_unexpired)).and_then(|(_,c)|c.clone());
             if let Some(c)=result {
-                if !c.segmented||!c.segments.is_empty(){return c;}
+                if !c.segmented||c.has_segment_timing(){return c;}
             }
         }
     }
@@ -306,7 +364,7 @@ impl AudioService {
             bounded_bytes(response, 256 * 1024).await
         };
         let playlist = tokio::time::timeout(Duration::from_secs(5), fetch_playlist).await.map_err(|_| ())??;
-        c.segments = hls_segments(std::str::from_utf8(&playlist).map_err(|_| ())?, &c.url, c.duration).ok_or(())?;
+        (c.segments, c.segment_durations) = hls_segments(std::str::from_utf8(&playlist).map_err(|_| ())?, &c.url, c.duration).ok_or(())?;
         c.segmented = true;
         c.content_type = "audio/mp4".into();
         let (mut init, first) = tokio::try_join!(
@@ -369,15 +427,22 @@ impl AudioService {
         let part = file.as_ref().map(|_| PartialGuard { path: partial });
         let service = self.clone();
         let remaining = c.segments.len() - 1;
-        let segments = futures_util::stream::iter(c.segments[2..].to_vec().into_iter().map(move |url| {
+        let gate = self.requested_gate(&t.id, &request);
+        let initial_segments = c.initial_segments();
+        let urls = c.segments[2..].to_vec();
+        let segments = futures_util::stream::iter(urls.into_iter().enumerate().map(move |(index, url)| {
             let service = service.clone();
-            async move { service.fetch_segment(&url).await.map(axum::body::Bytes::from) }
+            let gate = gate.clone().filter(|_| index + 1 >= initial_segments);
+            async move {
+                wait_for_buffer(gate).await;
+                service.fetch_segment(&url).await.map(axum::body::Bytes::from)
+            }
         })).buffered(3);
         let active = self.active_guard(&t.id);
         let state = StreamState {
             file, upstream: None, head: None, service: self.clone(), track: t.clone(),
             candidate: c, count: 0, length: None, position: 0, end: 0, segment_end: 0,
-            retries: 0, _part: part, _writer: writer, _active: active,
+            retries: 0, buffer_gate: None, _part: part, _writer: writer, _active: active,
         };
         let body = futures_util::stream::try_unfold(
             (state, Some(head), Box::pin(segments), remaining),
@@ -463,16 +528,37 @@ impl AudioService {
     pub async fn stream(self:&Arc<Self>,t:&Track,request:Request<Body>)->Result<Response,ApiError> {
         // A reader is marked active under the same lock used by eviction.
         let io=self.cache_io.lock().await;
-        if let Some((path,mime,_,_))=self.cached(&t.id).await? {
+        if let Some((path,mime,duration,_))=self.cached(&t.id).await? {
             let guard=self.active_guard(&t.id);
             sqlx::query("UPDATE audio_cache SET last_accessed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE track_id=?").bind(&t.id).execute(&self.db).await?;
+            let gate = self.requested_gate(&t.id, &request);
+            let bytes = if gate.is_some() { tokio::fs::metadata(&path).await.ok().map(|meta| meta.len()) } else { None };
             let response=ServeFile::new(path).oneshot(request).await.map_err(|_|media_error("cache read failed"))?;
             let (mut parts,body)=response.into_parts();parts.headers.insert(header::CONTENT_TYPE,mime.parse().map_err(|_|media_error("invalid audio type"))?);
             if parts.status.is_success() {
                 parts.headers.insert("x-yamusic-mode", header::HeaderValue::from_static("full"));
             }
             drop(io);
-            let stream=Body::new(body).into_data_stream().map(move |chunk| { let _keep_alive=&guard; chunk });
+            let start = parts.headers.get(header::CONTENT_RANGE).and_then(|value| value.to_str().ok())
+                .and_then(parse_content_range).map_or(0, |(start, _, _)| start);
+            let length = parts.headers.get(header::CONTENT_LENGTH).and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok()).unwrap_or(0);
+            let gate = bytes.zip(gate).filter(|_| parts.status.is_success()).and_then(|(bytes, gate)| {
+                let limit = initial_byte_limit(bytes, duration);
+                (start < limit && limit < start.saturating_add(length)).then_some((limit, gate))
+            });
+            let stream = futures_util::stream::try_unfold(
+                (Body::new(body).into_data_stream(), guard, start, gate),
+                |(mut stream, guard, mut position, mut gate)| async move {
+                    if gate.as_ref().is_some_and(|(limit, _)| position >= *limit) {
+                        wait_for_buffer(gate.take().map(|(_, gate)| gate)).await;
+                    }
+                    let Some(chunk) = stream.next().await else { return Ok::<_, axum::Error>(None); };
+                    let chunk = chunk?;
+                    position += chunk.len() as u64;
+                    Ok(Some((chunk, (stream, guard, position, gate))))
+                },
+            );
             return Ok(Response::from_parts(parts,Body::from_stream(stream)));
         }
         drop(io);
@@ -482,7 +568,8 @@ impl AudioService {
         if let Some(candidate)=self.resolve(t).await? {
             if self.cached(&t.id).await?.is_some(){return Box::pin(self.stream(t,request)).await;}
             let retry = !request.uri().query().is_some_and(|q| q.split('&').any(|p| p == "refresh=1"));
-            let mut renewal = Request::builder().method(request.method()).uri("/?refresh=1");
+            let original_query = request.uri().query().unwrap_or_default();
+            let mut renewal = Request::builder().method(request.method()).uri(format!("/?refresh=1&{original_query}"));
             if let Some(range) = request.headers().get(header::RANGE) {
                 renewal = renewal.header(header::RANGE, range);
             }
@@ -529,17 +616,24 @@ impl AudioService {
             .header(header::CONTENT_TYPE,&c.content_type).header(header::ACCEPT_RANGES,"bytes").header(header::CONTENT_LENGTH,length).header("x-yamusic-mode","full");
         if range.is_some(){response=response.header(header::CONTENT_RANGE,format!("bytes {start}-{end}/{}",c.byte_len));}
         if request.method()==Method::HEAD{return response.body(Body::empty()).map_err(|_|media_error("head response failed"));}
+        // A direct file has a byte length but may have a variable bitrate.
+        // Leave headroom so metadata, container overhead and bitrate peaks fit.
+        let initial_limit = initial_byte_limit(c.byte_len, c.duration);
+        let gate = self.requested_gate(&t.id, &request).filter(|_| start < initial_limit);
+        let initial_request_end = if gate.is_some() {
+            end.min(initial_limit - 1)
+        } else { end };
         let head=if start < START_BUFFER {
             self.head(t,&c).await.filter(|head| start < head.len() as u64).map(|head| head.slice(start as usize..))
         } else { None };
-        let (upstream,segment_end)=if head.is_some(){(None,0)}else{let first = self.fragment(&c,start,end.min(start.saturating_add(STREAM_WINDOW - 1)));
+        let (upstream,segment_end)=if head.is_some(){(None,0)}else{let first = self.fragment(&c,start,initial_request_end.min(start.saturating_add(STREAM_WINDOW - 1)));
             let (response,end)=tokio::time::timeout(Duration::from_secs(5), first).await.map_err(|_|media_error("audio startup timeout"))??;(Some(response),end)};
         let lock=self.lock(format!("file:{}",t.id)).await;
         let write_guard=if start==0&&end+1==c.byte_len&&c.byte_len<=self.budget{lock.try_lock_owned().ok()}else{None};
         let file=if write_guard.is_some(){tokio::fs::create_dir_all(&self.root).await.ok();tokio::fs::File::create(self.root.join(format!("{}.part",t.id))).await.ok()}else{None};
         let part=if file.is_some(){Some(PartialGuard{path:self.root.join(format!("{}.part",t.id))})}else{None};
         let active=self.active_guard(&t.id);
-        let state=StreamState {file,upstream,head,service:self.clone(),track:t.clone(),candidate:c,count:0,length:Some(length),position:start,end,segment_end,retries:0,_part:part,_writer:write_guard,_active:active};
+        let state=StreamState {file,upstream,head,service:self.clone(),track:t.clone(),candidate:c,count:0,length:Some(length),position:start,end,segment_end,retries:0,buffer_gate:gate.map(|gate| (initial_limit,gate)),_part:part,_writer:write_guard,_active:active};
         response.body(stream_body(state)).map_err(|_|media_error("invalid stream response"))
     }
     pub async fn evict(&self)->Result<(),sqlx::Error> {
@@ -586,6 +680,7 @@ struct StreamState {
     file: Option<tokio::fs::File>, upstream: Option<reqwest::Response>, head:Option<axum::body::Bytes>,
     service: Arc<AudioService>, track:Track, candidate:Candidate, count:u64, length:Option<u64>,
     position:u64,end:u64,segment_end:u64,retries:u8,
+    buffer_gate: Option<(u64, watch::Receiver<bool>)>,
     _part:Option<PartialGuard>, _writer:Option<tokio::sync::OwnedMutexGuard<()>>, _active:ActiveGuard,
 }
 impl StreamState {
@@ -611,8 +706,12 @@ fn stream_body(state:StreamState)->Body {
                     if let Some(file)=state.file.as_mut(){if file.write_all(&chunk).await.is_err(){state.file=None;}}
                     if state.position>state.end{state.finish().await;}return Ok(Some((chunk,state)));
                 }
+                if state.buffer_gate.as_ref().is_some_and(|(limit, _)| state.position >= *limit) {
+                    wait_for_buffer(state.buffer_gate.take().map(|(_, gate)| gate)).await;
+                }
                 if state.upstream.is_none(){
-                    let (response,end)=state.service.fragment(&state.candidate,state.position,state.end.min(state.position.saturating_add(STREAM_WINDOW - 1))).await.map_err(|_|std::io::Error::other("audio reconnect failed"))?;
+                    let end = state.buffer_gate.as_ref().map_or(state.end, |(limit, _)| state.end.min(limit - 1));
+                    let (response,end)=state.service.fragment(&state.candidate,state.position,end.min(state.position.saturating_add(STREAM_WINDOW - 1))).await.map_err(|_|std::io::Error::other("audio reconnect failed"))?;
                     state.upstream=Some(response);state.segment_end=end;
                 }
                 match state.upstream.as_mut().unwrap().chunk().await {
@@ -663,17 +762,18 @@ async fn bounded_bytes(mut response:reqwest::Response,limit:usize)->Result<Vec<u
     }
     Ok(bytes)
 }
-fn hls_segments(playlist:&str,base:&str,expected_duration:f64)->Option<Vec<String>> {
+fn hls_segments(playlist:&str,base:&str,expected_duration:f64)->Option<(Vec<String>, Vec<f64>)> {
     // Support complete, unencrypted fMP4 VOD only. Never cache a preview or
     // concatenate transport-stream audio under an MP4 content type.
     if !playlist.starts_with("#EXTM3U") || !playlist.lines().any(|l|l.trim()=="#EXT-X-ENDLIST") || playlist.contains("#EXT-X-KEY:") || playlist.contains("#EXT-X-BYTERANGE:"){return None;}
     let base=reqwest::Url::parse(base).ok()?;let mut result=Vec::new();let mut duration=0.0;
+    let mut durations = Vec::new();
     for line in playlist.lines().map(str::trim) {
         let url=if let Some(map)=line.strip_prefix("#EXT-X-MAP:URI=\"") {
             if !result.is_empty(){return None;}Some(map.split('"').next()?)
         }else if let Some(info)=line.strip_prefix("#EXTINF:") {
             let value=info.split(',').next()?.parse::<f64>().ok()?;
-            if !value.is_finite()||value<=0.0{return None;}duration+=value;None
+            if !value.is_finite()||value<=0.0{return None;}duration+=value;durations.push(value);None
         }else if !line.is_empty()&&!line.starts_with('#') {
             if result.is_empty(){return None;}Some(line)
         }else{None};
@@ -682,11 +782,15 @@ fn hls_segments(playlist:&str,base:&str,expected_duration:f64)->Option<Vec<Strin
             result.push(url);if result.len()>512{return None;}
         }
     }
-    if result.len()<2 || (duration-expected_duration).abs()>4.0{return None;}
-    Some(result)
+    if result.len()<2 || durations.len() + 1 != result.len() || (duration-expected_duration).abs()>4.0{return None;}
+    Some((result, durations))
 }
 struct ForegroundGuard<'a>(&'a AtomicUsize);
 impl Drop for ForegroundGuard<'_>{fn drop(&mut self){self.0.fetch_sub(1,Ordering::Relaxed);}}
+fn initial_byte_limit(bytes: u64, duration: f64) -> u64 {
+    let estimate = ((INITIAL_BUFFER_SECONDS + 8.0) / duration.max(1.0) * bytes as f64).ceil() as u64;
+    estimate.max(START_BUFFER).min(bytes)
+}
 fn now_seconds()->u64 {SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()}
 fn candidate_unexpired(c:&Candidate)->bool{reqwest::Url::parse(&c.url).ok().and_then(|u|u.query_pairs().find(|(k,_)|k=="expire").and_then(|(_,v)|v.parse::<u64>().ok())).is_none_or(|expiry|expiry>now_seconds()+20)}
 fn media_error(detail:&str)->ApiError {ApiError::provider(detail.into())}
@@ -745,7 +849,7 @@ fn candidate_from_metadata(v:&Value,source:&str,t:&Track,complete:bool)->Option<
     if date.as_ref().is_some_and(|d|d.len()==8&&d.chars().all(|c|c.is_ascii_digit())&&d.as_str()<"20260301"){score+=50;}
     if ["uncensored","без цензуры","explicit","original"].iter().any(|w|lowered.contains(w)){score+=30;}
     if lowered.contains("official audio"){score+=15;}if lowered.contains("official video"){score-=10;}
-    Some(Candidate{source:source.into(),page_url:page.into(),title:title.into(),artist:artist.into(),duration,upload_date:date,score,url:String::new(),content_type:"audio/mpeg".into(),byte_len:0,segmented:false,segments:Vec::new()})
+    Some(Candidate{source:source.into(),page_url:page.into(),title:title.into(),artist:artist.into(),duration,upload_date:date,score,url:String::new(),content_type:"audio/mpeg".into(),byte_len:0,segmented:false,segments:Vec::new(),segment_durations:Vec::new()})
 }
 pub fn allowed_media_url(value:&str)->bool {
     reqwest::Url::parse(value).ok().is_some_and(|u|u.scheme()=="https"&&u.username().is_empty()&&u.password().is_none()&&u.port_or_known_default()==Some(443)&&u.host_str().is_some_and(|host|["googlevideo.com","sndcdn.com","soundcloud.com","soundcloud.cloud","dzcdn.net"].iter().any(|suffix|host==*suffix||host.ends_with(&format!(".{suffix}")))))
@@ -766,7 +870,7 @@ mod tests {
     #[test] fn hls_requires_full_unencrypted_fmp4_and_safe_hosts(){
         let playlist="#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:10,\n1.m4s\n#EXTINF:10,\n2.m4s\n#EXT-X-ENDLIST\n";
         let base="https://playback.media-streaming.soundcloud.cloud/test/index.m3u8";
-        assert_eq!(hls_segments(playlist,base,20.0).unwrap().len(),3);
+        assert_eq!(hls_segments(playlist,base,20.0).unwrap().0.len(),3);
         assert!(hls_segments(playlist,base,120.0).is_none(),"preview must not be accepted as full audio");
         for bad in [playlist.replace("init.mp4","https://127.0.0.1/init"),playlist.replace("#EXT-X-ENDLIST","#EXT-X-KEY:METHOD=AES-128"),playlist.replace("#EXT-X-MAP:URI=\"init.mp4\"","")] {assert!(hls_segments(&bad,base,20.0).is_none());}
         assert!(!version_matches("madk1d, greyrock - распять (29.08.2025 москва @ vk музыка летом)","распять","GreyRock"));
@@ -830,6 +934,36 @@ mod tests {
         let count:i64=sqlx::query_scalar("SELECT count(*) FROM audio_cache").fetch_one(&db).await.unwrap();assert_eq!(count,0);
         drop(service);db.close().await;
     }
+    #[tokio::test]
+    async fn cached_audio_waits_at_the_initial_buffer_until_playback_releases_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("test.db").to_string_lossy().replace('\\', "/"));
+        let db = crate::connect_database(&url).await.unwrap();
+        sqlx::query("INSERT INTO tracks (id,deezer_id,title,artist,artist_id,album,album_id,duration_sec) VALUES ('deezer_42',42,'Song','Artist',1,'Album',1,180)").execute(&db).await.unwrap();
+        let track = sqlx::query_as::<_, Track>("SELECT * FROM tracks WHERE id='deezer_42'").fetch_one(&db).await.unwrap();
+        let service = AudioService::configured(db.clone(), dir.path().join("audio"), 2 * 1024 * 1024, "not-used".into());
+        tokio::fs::create_dir_all(&service.root).await.unwrap();
+        let size = 1024 * 1024;
+        let path = service.path(&track.id);
+        tokio::fs::write(&path, vec![7; size]).await.unwrap();
+        sqlx::query("INSERT INTO audio_cache (track_id,source_type,source_url,local_file_path,file_size_bytes,content_type,duration_sec) VALUES ('deezer_42','youtube','fixture',?,?,'audio/webm',180)")
+            .bind(path.to_string_lossy().as_ref()).bind(size as i64).execute(&db).await.unwrap();
+        let token = "12345678-1234-1234-1234-123456789abc";
+        let request = Request::builder().uri(format!("/?buffer={token}")).header(header::RANGE, "bytes=0-").body(Body::empty()).unwrap();
+        let response = service.stream(&track, request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        let mut body = response.into_body().into_data_stream();
+        let limit = initial_byte_limit(size as u64, track.duration_sec as f64);
+        let mut received = 0;
+        while received < limit {
+            received += body.next().await.unwrap().unwrap().len() as u64;
+        }
+        assert!(received < size as u64);
+        assert!(tokio::time::timeout(Duration::from_millis(50), body.next()).await.is_err());
+        service.continue_stream(&track.id, token).unwrap();
+        while let Some(chunk) = body.next().await { received += chunk.unwrap().len() as u64; }
+        assert_eq!(received, size as u64);
+    }
     #[tokio::test] async fn cache_commits_before_last_bytes_even_if_reader_never_polls_eof(){
         let dir=tempfile::tempdir().unwrap();
         let db=crate::connect_database(&format!("sqlite://{}",dir.path().join("test.db").to_string_lossy().replace('\\',"/"))).await.unwrap();
@@ -843,7 +977,7 @@ mod tests {
         tokio::fs::create_dir_all(&service.root).await.unwrap();
         let partial=service.root.join("deezer_42.part");let file=tokio::fs::File::create(&partial).await.unwrap();
         let mut selected=candidate(&serde_json::json!({"title":"Artist - Song","uploader":"Artist","duration":200,"url":"https://www.youtube.com/watch?v=fixture"}),"youtube",&track).unwrap();selected.byte_len=1024;
-        let state=StreamState{file:Some(file),upstream:Some(response),head:None,service:service.clone(),track,candidate:selected,count:0,length:Some(1024),position:0,end:1023,segment_end:1023,retries:0,_part:Some(PartialGuard{path:partial}),_writer:None,_active:service.active_guard("deezer_42")};
+        let state=StreamState{file:Some(file),upstream:Some(response),head:None,service:service.clone(),track,candidate:selected,count:0,length:Some(1024),position:0,end:1023,segment_end:1023,retries:0,buffer_gate:None,_part:Some(PartialGuard{path:partial}),_writer:None,_active:service.active_guard("deezer_42")};
         let mut body=Box::pin(stream_body(state).into_data_stream());let mut received=0;
         while received<1024 {received+=body.next().await.unwrap().unwrap().len();}
         // An HTTP reader can stop at Content-Length without asking for EOF.

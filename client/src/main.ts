@@ -943,28 +943,8 @@ function updateProgress(): void {
   updateLyrics();
   document.querySelectorAll<HTMLInputElement>('[data-seek]').forEach(el => {
     el.max = String(player.duration);
-function updateBufferedRanges(): void {
-  const ranges = player.mirroring ? undefined : player.audio.buffered;
-  const duration = player.duration;
-  const stops = ['var(--range-track) 0%'];
-  if (duration > 0 && ranges) {
-    for (let index = 0; index < ranges.length; index++) {
-      const start = Math.min(100, ranges.start(index) / duration * 100);
-      const end = Math.min(100, ranges.end(index) / duration * 100);
-      stops.push(`var(--range-track) ${start}%, var(--range-buffer) ${start}% ${end}%, var(--range-track) ${end}%`);
-    }
-  }
-  stops.push('var(--range-track) 100%');
-  const background = `linear-gradient(to right, ${stops.join(', ')})`;
-  for (const input of document.querySelectorAll<HTMLInputElement>('[data-seek]')) {
-    if (input.style.getPropertyValue('--range-buffer-background') !== background) {
-      input.style.setProperty('--range-buffer-background', background);
-    }
-  }
-}
     el.value = String(player.time);
     fillRange(el);
-  updateBufferedRanges();
   });
   document.querySelectorAll('[data-elapsed]').forEach(el => el.textContent = formatTime(player.time));
   document.querySelectorAll('[data-duration]').forEach(el => el.textContent = formatTime(player.duration));
@@ -2330,7 +2310,6 @@ player.addEventListener('tick',()=>{
   updateProgress();
   if(player.playing&&!player.mirroring)void persistPlayback();
 });
-player.addEventListener('bufferprogress',updateBufferedRanges);
 player.addEventListener('pause',()=>{
   if(player.mode==='full')void persistPlayback(true);
 });

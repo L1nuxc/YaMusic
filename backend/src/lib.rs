@@ -119,6 +119,7 @@ pub fn app(state: AppState, dist: PathBuf) -> Router {
         .route("/lyrics/{id}/translation", post(lyrics::translate))
         .route("/playback/{id}", get(playback))
         .route("/stream/{id}", get(stream))
+        .route("/stream/{id}/continue", post(continue_stream))
         .route("/prefetch", post(prefetch))
         .route("/recommendations/status", get(recommendations::status))
         .route("/recommendations/artists", get(recommendations::artists).put(recommendations::set_artists))
@@ -411,6 +412,16 @@ async fn stream(State(state):State<AppState>,Path(id):Path<String>,request:Reque
     let t=stored_track(&state,&id).await?;
     state.audio.stream(&t,request).await
 }
+#[derive(Deserialize)]
+struct ContinueStream { buffer: String }
+async fn continue_stream(
+    State(state): State<AppState>, Path(id): Path<String>, Query(params): Query<ContinueStream>,
+) -> Result<StatusCode, ApiError> {
+    let id = format!("deezer_{}", parse_id(&id)?);
+    state.audio.continue_stream(&id, &params.buffer)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[derive(Deserialize)]
 struct Prefetch { ids:Vec<String>, #[serde(default)] playback:bool }
 async fn prefetch(State(state):State<AppState>,Json(body):Json<Prefetch>)->Result<StatusCode,ApiError> {
