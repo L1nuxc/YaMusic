@@ -13,6 +13,8 @@ import type { LyricLine } from './lyrics.ts';
 import { languageCodes, languageName } from './translation-settings.ts';
 import { parseSpotifyExport, type SpotifyExportPlaylist } from './spotify-export.ts';
 import { animateDropdown, mountSpringSelect, mountSpringSwitch } from './spring-controls.ts';
+import { jellySlider, mountJellySlider } from './jelly-slider.ts';
+import { mountPillGroups, selectPillButton, syncTabPill } from './tab-pill.ts';
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
 const dialog = document.querySelector<HTMLDialogElement>('#dialog')!;
@@ -186,7 +188,7 @@ app.innerHTML = `
   <div class="app-shell" hidden>
     <aside class="sidebar" aria-label="Боковое меню">
       <a class="brand" href="#/home" aria-label="YaMusic — главная">${icon('audio-lines')}<span>YaMusic<span class="brand-dot">.</span></span></a>
-      <nav class="desktop-navigation" aria-label="Основная навигация">${navItems.map(n => `<a href="#/${n.page}" data-page="${n.page}" class="navigation-link">${icon(n.glyph)}<span>${n.label}</span></a>`).join('')}</nav>
+      <nav class="desktop-navigation tab-pill-group" aria-label="Основная навигация">${navItems.map(n => `<a href="#/${n.page}" data-page="${n.page}" class="navigation-link">${icon(n.glyph)}<span>${n.label}</span></a>`).join('')}</nav>
       <div class="settings-account"><a href="#/settings" data-page="settings">${icon('settings-2')}<span>Настройки</span></a><button data-action="account" data-account-avatar aria-label="Мой аккаунт" title="Мой аккаунт">${accountAvatar()}</button></div>
     </aside>
     <div class="workspace">
@@ -195,7 +197,7 @@ app.innerHTML = `
       <main id="main" tabindex="-1"></main>
     </div>
     <footer class="player-bar" aria-label="Плеер"></footer>
-    <nav class="mobile-navigation" aria-label="Основная навигация"><div class="navigation-lens"></div>${navItems.map(n => `<a href="#/${n.page}" data-page="${n.page}">${icon(n.glyph)}<span>${n.label}</span></a>`).join('')}</nav>
+    <nav class="mobile-navigation tab-pill-group" aria-label="Основная навигация"><span class="tab-pill navigation-lens" aria-hidden="true" hidden></span>${navItems.map(n => `<a href="#/${n.page}" data-page="${n.page}">${icon(n.glyph)}<span>${n.label}</span></a>`).join('')}</nav>
   </div>
   <section class="login-screen" aria-labelledby="login-title">
     <div class="login-card">
@@ -315,11 +317,12 @@ function home(): void {
 }
 
 function search(): void {
-  main.innerHTML = `<div class="page-heading"><div><span class="eyebrow">ВЕСЬ МИР МУЗЫКИ</span><h1>Поиск</h1></div></div><form class="search-form" id="search-form" role="search">${icon('search')}<input id="search-input" name="q" type="search" placeholder="Трек, исполнитель или альбом" autocomplete="off" aria-label="Поиск музыки" maxlength="200" value="${e(searchQuery)}"/><kbd>↵</kbd></form><button class="text-button lyric-search-link" data-action="search-by-lyrics">${icon('sparkles')}Найти по строке песни</button><div class="filter-row" role="group" aria-label="Что искать">${[['all','Всё'],['track','Треки'],['album','Альбомы'],['artist','Исполнители']].map(([id,title])=>`<button class="chip ${searchFilter === id ? 'selected' : ''}" data-action="search-filter" data-filter="${id}" aria-pressed="${searchFilter === id}">${title}</button>`).join('')}</div><div id="search-results"></div>`;
+  main.innerHTML = `<div class="page-heading"><div><span class="eyebrow">ВЕСЬ МИР МУЗЫКИ</span><h1>Поиск</h1></div></div><form class="search-form" id="search-form" role="search">${icon('search')}<input id="search-input" name="q" type="search" placeholder="Трек, исполнитель или альбом" autocomplete="off" aria-label="Поиск музыки" maxlength="200" value="${e(searchQuery)}"/><kbd>↵</kbd></form><button class="text-button lyric-search-link" data-action="search-by-lyrics">${icon('sparkles')}Найти по строке песни</button><div class="filter-row"><div class="tab-pill-group" role="group" aria-label="Что искать">${[['all','Всё'],['track','Треки'],['album','Альбомы'],['artist','Исполнители']].map(([id,title])=>`<button class="chip ${searchFilter === id ? 'selected' : ''}" data-action="search-filter" data-filter="${id}" aria-pressed="${searchFilter === id}">${title}</button>`).join('')}</div></div><div id="search-results"></div>`;
   if (searchQuery && searchResults) drawSearchResults();
   else if (searchQuery) void runSearch();
   else drawSearchStart();
   hydrateIcons(main);
+  syncTabPill(main.querySelector<HTMLElement>(".tab-pill-group")!);
 }
 function saveSearchHistory():void {try{localStorage.setItem(SEARCH_HISTORY_KEY,JSON.stringify(searchHistory));}catch{/* Browsing remains available with full storage. */}}
 function rememberCurrentSearch():void {if(!searchQuery.trim())return;searchHistory=rememberSearch(searchHistory,searchQuery);saveSearchHistory();}
@@ -397,10 +400,14 @@ let libraryFilter = 'all';
 function libraryView(): void {
   hydrateSavedCredits([...library.likes,...library.history.slice(0,5),...library.playlists.flatMap(p=>p.tracks.slice(0,1))]);
   visibleTracks = library.likes;
-  main.innerHTML = `<div class="page-heading"><div><span class="eyebrow">ТО, ЧТО БЛИЗКО</span><h1>Медиатека</h1></div><div class="heading-actions"><a class="secondary-button library-settings" href="#/settings" aria-label="Настройки" title="Настройки">${icon('settings-2')}</a><button class="secondary-button" data-action="import" aria-label="Импорт коллекции">${icon('import')}<span>Импорт</span></button><button class="secondary-button" data-action="new-playlist" aria-label="Создать плейлист">${icon('plus')}<span>Плейлист</span></button></div></div><div class="filter-row" aria-label="Раздел медиатеки">${[['all','Всё'],['playlists','Плейлисты'],['likes','Мне нравится'],['artists','Исполнители']].map(([id,label])=>`<button class="chip ${libraryFilter === id ? 'selected' : ''}" data-action="library-filter" data-filter="${id}" aria-pressed="${libraryFilter === id}">${label}</button>`).join('')}<span class="local-library-note">На этом устройстве</span></div>`;
+  if (!main.querySelector("#library-results")) main.innerHTML = `<div class="page-heading"><div><span class="eyebrow">ТО, ЧТО БЛИЗКО</span><h1>Медиатека</h1></div><div class="heading-actions"><a class="secondary-button library-settings" href="#/settings" aria-label="Настройки" title="Настройки">${icon('settings-2')}</a><button class="secondary-button" data-action="import" aria-label="Импорт коллекции">${icon('import')}<span>Импорт</span></button><button class="secondary-button" data-action="new-playlist" aria-label="Создать плейлист">${icon('plus')}<span>Плейлист</span></button></div></div><div class="filter-row"><div class="tab-pill-group" role="group" aria-label="Раздел медиатеки">${[['all','Всё'],['playlists','Плейлисты'],['likes','Мне нравится'],['artists','Исполнители']].map(([id,label])=>`<button class="chip ${libraryFilter === id ? 'selected' : ''}" data-action="library-filter" data-filter="${id}" aria-pressed="${libraryFilter === id}">${label}</button>`).join('')}</div><span class="local-library-note">На этом устройстве</span></div><div id="library-results"></div>`;
+  const group = main.querySelector<HTMLElement>('.tab-pill-group')!;
+  selectPillButton(group, 'data-filter', libraryFilter);
+  const results = main.querySelector<HTMLElement>('#library-results')!;
+  results.replaceChildren();
   if (libraryFilter === 'artists') {
     const section=document.createElement('section');
-    section.className='section';section.innerHTML=loading();main.append(section);
+    section.className='section';section.innerHTML=loading();results.append(section);
     const epoch=authEpoch;
     void authReady.then(()=>api.favoriteArtists()).then(({artists})=>{
       if(!section.isConnected||epoch!==authEpoch)return;
@@ -410,9 +417,9 @@ function libraryView(): void {
       hydrateIcons(section);
     }).catch(error=>{if(section.isConnected&&epoch===authEpoch){section.innerHTML=errorState(error);hydrateIcons(section);}});
   } else if (libraryFilter === 'likes') {
-    main.insertAdjacentHTML('beforeend', library.likes.length ? `<section class="section">${sectionHeading('Мне нравится', `<button class="primary-button" data-action="play-likes">${icon('play')}Слушать</button>`)}${rows(library.likes)}</section>` : empty('Здесь будет любимая музыка', 'Нажмите сердечко рядом с треком — он останется здесь.', 'heart', '<a href="#/search" class="primary-button">Найти музыку</a>'));
+    results.insertAdjacentHTML('beforeend', library.likes.length ? `<section class="section">${sectionHeading('Мне нравится', `<button class="primary-button" data-action="play-likes">${icon('play')}Слушать</button>`)}${rows(library.likes)}</section>` : empty('Здесь будет любимая музыка', 'Нажмите сердечко рядом с треком — он останется здесь.', 'heart', '<a href="#/search" class="primary-button">Найти музыку</a>'));
   } else {
-    main.insertAdjacentHTML('beforeend', `<div class="card-grid library-grid">${libraryFilter === 'all' ? `<button class="music-card" data-action="library-filter" data-filter="likes"><span class="card-image favorites-art">${icon('heart')}</span><strong>Мне нравится</strong><span>${library.likes.length ? trackCount(library.likes.length) : 'Самое близкое — здесь'}</span></button>` : ''}${library.playlists.map(p=>`<button class="music-card" data-action="playlist" data-id="${e(p.id)}"><span class="card-image ${p.cover_url || p.tracks.length ? '' : 'empty-playlist-art'}">${p.cover_url || p.tracks.length ? image(p.cover_url || p.tracks[0].cover_url) : icon('list-music')}</span><strong>${e(p.title)}</strong><span>${trackCount(p.tracks.length)}</span></button>`).join('')}<button class="music-card new-playlist-card" data-action="new-playlist"><span class="card-image">${icon('plus')}</span><strong>Новый плейлист</strong><span>Музыка под ваш момент</span></button></div>${library.history.length ? `<section class="section">${sectionHeading('Недавно слушали', '<a class="text-button" href="#/history">Вся история '+icon('arrow-right')+'</a>')}${rows(library.history,5)}</section>` : `<section class="library-welcome">${icon('audio-lines')}<div><h2>Всё начинается с одной песни</h2><p>Сохраняйте любимое и собирайте свои плейлисты.</p></div><a class="text-button" href="#/search">В каталог ${icon('arrow-right')}</a></section>`}`);
+    results.insertAdjacentHTML('beforeend', `<div class="card-grid library-grid">${libraryFilter === 'all' ? `<button class="music-card" data-action="library-filter" data-filter="likes"><span class="card-image favorites-art">${icon('heart')}</span><strong>Мне нравится</strong><span>${library.likes.length ? trackCount(library.likes.length) : 'Самое близкое — здесь'}</span></button>` : ''}${library.playlists.map(p=>`<button class="music-card" data-action="playlist" data-id="${e(p.id)}"><span class="card-image ${p.cover_url || p.tracks.length ? '' : 'empty-playlist-art'}">${p.cover_url || p.tracks.length ? image(p.cover_url || p.tracks[0].cover_url) : icon('list-music')}</span><strong>${e(p.title)}</strong><span>${trackCount(p.tracks.length)}</span></button>`).join('')}<button class="music-card new-playlist-card" data-action="new-playlist"><span class="card-image">${icon('plus')}</span><strong>Новый плейлист</strong><span>Музыка под ваш момент</span></button></div>${library.history.length ? `<section class="section">${sectionHeading('Недавно слушали', '<a class="text-button" href="#/history">Вся история '+icon('arrow-right')+'</a>')}${rows(library.history,5)}</section>` : `<section class="library-welcome">${icon('audio-lines')}<div><h2>Всё начинается с одной песни</h2><p>Сохраняйте любимое и собирайте свои плейлисты.</p></div><a class="text-button" href="#/search">В каталог ${icon('arrow-right')}</a></section>`}`);
   }
   hydrateIcons(main);
 }
@@ -449,8 +456,10 @@ function mountTranslationSettings(): void {
 }
 function settings(): void {
   closeTranslationMenus?.();
-  main.innerHTML = `<div class="page-heading"><div><span class="eyebrow">ВАШЕ ПРОСТРАНСТВО</span><h1>Настройки</h1></div></div><div class="settings-content"><button class="profile-summary" data-action="account"><span class="profile-avatar" data-account-avatar>${accountAvatar()}</span><span><strong>${authUser?e(authUser.first_name||authUser.username||"Мой профиль"):"Мой профиль"}</strong><small>${authUser?"Telegram подключён":"Войти через Telegram"}</small></span>${icon('chevron-right')}</button><section class="settings-group"><h2>Оформление</h2><div class="setting-row"><div class="setting-label">${icon('palette')}<span>Тема</span></div><div class="segmented" role="group" aria-label="Цветовая тема"><button data-action="theme" data-theme="dark" class="${library.settings.theme === 'dark' ? 'selected' : ''}" aria-pressed="${library.settings.theme === 'dark'}">Тёмная</button><button data-action="theme" data-theme="light" class="${library.settings.theme === 'light' ? 'selected' : ''}" aria-pressed="${library.settings.theme === 'light'}">Светлая</button></div></div><label class="setting-row"><span class="setting-label">${icon('waves')}<span><span id="animations-label">Анимации</span><small id="animations-description">Живая волна и анимация интерфейса</small></span></span><span class="spring-switch"><input id="animations" type="checkbox" role="switch" aria-labelledby="animations-label" aria-describedby="animations-description" ${library.settings.animations ? 'checked' : ''}><span class="spring-switch-thumb" aria-hidden="true"></span></span></label></section><section class="settings-group"><h2>Воспроизведение</h2><label class="setting-row crossfade-setting"><span class="setting-label">Плавный переход<small>Новый трек начинает звучать перед концом предыдущего</small></span><span class="crossfade-value"><input id="crossfade" type="range" min="0" max="8" step="1" value="${library.settings.crossfade}"><output for="crossfade">${library.settings.crossfade?`${library.settings.crossfade} с`:'Выкл.'}</output></span></label></section><section class="settings-group"><h2>Тексты песен</h2><div class="setting-row"><span class="setting-label">${icon('mic-2')}Сервис перевода</span>${translationTrigger('translation-provider', 'Сервис перевода', translationLabels[library.settings.translation])}</div><div class="setting-row"><span class="setting-label">Язык перевода</span>${translationTrigger('translation-language', 'Язык перевода', languageName(library.settings.translationLanguage))}</div></section><section class="settings-group"><h2>Рекомендации</h2><div class="setting-row"><span class="setting-label">${icon('waves')}<span>Любимые исполнители<small>Помогите волне лучше узнать вас</small></span></span><button class="text-button" data-action="favorite-artists">Выбрать ${icon('chevron-right')}</button></div><div class="setting-row"><span class="setting-label">${icon('thumbs-down')}<span>Не рекомендовать</span></span><button class="text-button" data-action="blocked-tracks">Посмотреть список ${icon('chevron-right')}</button></div></section><section class="settings-group"><h2>Медиатека</h2><div class="setting-row"><span class="setting-label">${icon('library')}<span>Ваша коллекция<small>${library.likes.length} любимых · ${library.playlists.length} плейлистов</small></span></span><button class="text-button" data-action="export">Сохранить копию ${icon('download')}</button></div><div class="setting-row"><span class="setting-label">${icon('import')}<span>Перенос музыки</span></span><button class="text-button" data-action="import">Открыть ${icon('arrow-right')}</button></div></section><div class="settings-about">${icon('audio-lines')}<span><strong>YaMusic</strong><small>В вашем ритме · версия 0.1</small></span></div></div>`;
+  main.innerHTML = `<div class="page-heading"><div><span class="eyebrow">ВАШЕ ПРОСТРАНСТВО</span><h1>Настройки</h1></div></div><div class="settings-content"><button class="profile-summary" data-action="account"><span class="profile-avatar" data-account-avatar>${accountAvatar()}</span><span><strong>${authUser?e(authUser.first_name||authUser.username||"Мой профиль"):"Мой профиль"}</strong><small>${authUser?"Telegram подключён":"Войти через Telegram"}</small></span>${icon('chevron-right')}</button><section class="settings-group"><h2>Оформление</h2><div class="setting-row"><div class="setting-label">${icon('palette')}<span>Тема</span></div><div class="segmented tab-pill-group" role="group" aria-label="Цветовая тема"><button data-action="theme" data-theme="dark" class="${library.settings.theme === 'dark' ? 'selected' : ''}" aria-pressed="${library.settings.theme === 'dark'}">Тёмная</button><button data-action="theme" data-theme="light" class="${library.settings.theme === 'light' ? 'selected' : ''}" aria-pressed="${library.settings.theme === 'light'}">Светлая</button></div></div><label class="setting-row"><span class="setting-label">${icon('waves')}<span><span id="animations-label">Анимации</span><small id="animations-description">Живая волна и анимация интерфейса</small></span></span><span class="spring-switch"><input id="animations" type="checkbox" role="switch" aria-labelledby="animations-label" aria-describedby="animations-description" ${library.settings.animations ? 'checked' : ''}><span class="spring-switch-thumb" aria-hidden="true"></span></span></label></section><section class="settings-group"><h2>Воспроизведение</h2><label class="setting-row crossfade-setting"><span class="setting-label"><span><span id="crossfade-label">Плавный переход</span><small id="crossfade-description">Новый трек начинает звучать перед концом предыдущего</small></span></span>${jellySlider(library.settings.crossfade)}</label></section><section class="settings-group"><h2>Тексты песен</h2><div class="setting-row"><span class="setting-label">${icon('mic-2')}Сервис перевода</span>${translationTrigger('translation-provider', 'Сервис перевода', translationLabels[library.settings.translation])}</div><div class="setting-row"><span class="setting-label">Язык перевода</span>${translationTrigger('translation-language', 'Язык перевода', languageName(library.settings.translationLanguage))}</div></section><section class="settings-group"><h2>Рекомендации</h2><div class="setting-row"><span class="setting-label">${icon('waves')}<span>Любимые исполнители<small>Помогите волне лучше узнать вас</small></span></span><button class="text-button" data-action="favorite-artists">Выбрать ${icon('chevron-right')}</button></div><div class="setting-row"><span class="setting-label">${icon('thumbs-down')}<span>Не рекомендовать</span></span><button class="text-button" data-action="blocked-tracks">Посмотреть список ${icon('chevron-right')}</button></div></section><section class="settings-group"><h2>Медиатека</h2><div class="setting-row"><span class="setting-label">${icon('library')}<span>Ваша коллекция<small>${library.likes.length} любимых · ${library.playlists.length} плейлистов</small></span></span><button class="text-button" data-action="export">Сохранить копию ${icon('download')}</button></div><div class="setting-row"><span class="setting-label">${icon('import')}<span>Перенос музыки</span></span><button class="text-button" data-action="import">Открыть ${icon('arrow-right')}</button></div></section><div class="settings-about">${icon('audio-lines')}<span><strong>YaMusic</strong><small>В вашем ритме · версия 0.1</small></span></div></div>`;
   hydrateIcons(main);
+  syncTabPill(main.querySelector<HTMLElement>('.tab-pill-group')!);
+  mountJellySlider(main.querySelector<HTMLInputElement>('#crossfade')!);
   mountTranslationSettings();
   mountSpringSwitch(main.querySelector<HTMLInputElement>('#animations')!);
 }
@@ -522,8 +531,8 @@ function navigate(): void {
     link.classList.toggle('selected', selected);
     if (selected) link.setAttribute('aria-current', 'page'); else link.removeAttribute('aria-current');
   });
-  const navIndex = Math.max(0, navItems.findIndex(n => n.page === navPage));
-  mobileNav.style.setProperty('--tab', String(navIndex));
+  syncTabPill(app.querySelector<HTMLElement>('.desktop-navigation')!, true);
+  syncTabPill(mobileNav, true);
   document.querySelector('.topbar-title')!.textContent = ({home:'Для вас',search:'Поиск',library:'Медиатека',settings:'Настройки',album:'Альбом',artist:'Исполнитель',playlist:'Плейлист',mood:'Подборка',daily:'Микс дня',history:'История'} as Record<string,string>)[page] || 'YaMusic';
   main.className = `view-${page}`; main.scrollTop = 0; visibleTracks = [];
   if (page === 'home') home(); else if (page === 'search') search(); else if (page === 'library') libraryView(); else if (page === 'settings') settings();
@@ -1599,11 +1608,15 @@ document.addEventListener('click', async event => {
   }
   else if (action === 'search-filter') {
     searchFilter = target.dataset.filter || 'all';
-    main.querySelectorAll<HTMLElement>('[data-action="search-filter"]').forEach(b=> { b.classList.toggle('selected',b.dataset.filter === searchFilter); b.setAttribute('aria-pressed',String(b.dataset.filter === searchFilter)); });
+    selectPillButton(target.parentElement!, 'data-filter', searchFilter);
     if (searchQuery || main.querySelector<HTMLInputElement>('#search-input')?.value.trim()) void runSearch();
   } else if (action === 'search-suggestion') { const input = main.querySelector<HTMLInputElement>('#search-input')!; input.value = target.dataset.query || ''; void runSearch(); }
   else if (action === 'library-filter') { libraryFilter = target.dataset.filter || 'all'; libraryView(); }
-  else if (action === 'theme') { library.settings.theme = target.dataset.theme === 'light' ? 'light' : 'dark'; save(); applySettings(); settings(); }
+  else if (action === 'theme') {
+    library.settings.theme = target.dataset.theme === 'light' ? 'light' : 'dark';
+    save(); applySettings();
+    selectPillButton(target.parentElement!, 'data-theme', library.settings.theme);
+  }
   else if (action === 'reload') { if (currentView === 'search') void runSearch(); else { discovery = []; navigate(); } }
   else if (action === 'back') navigateBack();
   else if (action === 'export') {
@@ -1694,8 +1707,7 @@ document.addEventListener('input', event => {
     const seconds=Number(input.value);
     library.settings.crossfade=seconds;
     player.setCrossfade(seconds);
-    input.parentElement!.querySelector('output')!.textContent=seconds?`${seconds} с`:'Выкл.';
-    fillRange(input);save();
+    save();
   }
   else if (input.matches('[data-volume]')) { player.setVolume(Number(input.value)); library.settings.volume = player.volume; save(); fillRange(input); }
   else if (input.matches('[data-seek]')) { player.seek(Number(input.value)); fillRange(input); }
@@ -1940,4 +1952,5 @@ document.addEventListener('error',event=> {
   if (img.closest('.telegram-avatar')) { img.remove(); return; }
   if (app.contains(img)) { img.style.visibility='hidden'; img.parentElement?.classList.add('image-unavailable'); }
 },true);
+mountPillGroups();
 renderPlayer(); startSession();
