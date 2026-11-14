@@ -13,6 +13,8 @@ Site: https://yamusic.pigboss.xyz
 
 Update source and client/dist, then build with `CARGO_BUILD_JOBS=1 CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 cargo build --release --locked --manifest-path backend/Cargo.toml`. Install the binary with `deploy/activate.sh`.
 
+Keep the SQL migrations byte-for-byte identical to the Git blobs when packaging the source. SQLx verifies applied migration checksums, including line endings. From Windows, create deployment archives with `git -c core.autocrlf=false archive`.
+
 Spotify import uses `SPOTIFY_CLIENT_ID` from the Spotify Developer Dashboard. Register `https://yamusic.pigboss.xyz/api/import/spotify/callback` as the exact redirect URI. The authorization flow uses PKCE and needs no client secret. Google Translation and DeepL use `GOOGLE_TRANSLATE_API_KEY` and `DEEPL_API_KEY` respectively. Store these values in `/etc/yamusic/env` and restart the service.
 
 Operational checks: `systemctl status yamusic caddy`, `journalctl -u yamusic`, `curl https://yamusic.pigboss.xyz/api/health`.
