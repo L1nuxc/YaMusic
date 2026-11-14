@@ -11,6 +11,8 @@ use tokio::{io::{AsyncReadExt, AsyncWriteExt}, process::Command, sync::{Mutex, N
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 
+const START_BUFFER: u64 = 256 * 1024;
+const STREAM_WINDOW: u64 = 1024 * 1024;
 const MAX_FILE: u64 = 80 * 1024 * 1024;
 const SOUNDCLOUD_FORMAT: &str = "bestaudio[protocol=https]/bestaudio[protocol=http]/bestaudio[protocol=m3u8_native][container=m4a_dash]";
 type Locks = Mutex<HashMap<String,Weak<Mutex<()>>>>;
@@ -23,6 +25,7 @@ pub struct Candidate {
     #[serde(skip_serializing)] pub url: String,
     pub content_type: String, pub byte_len: u64,
     #[serde(default)] pub segmented: bool,
+    #[serde(default)] segments: Vec<String>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct PlaybackInfo {
@@ -35,6 +38,7 @@ pub struct AudioService {
     resolutions: Mutex<HashMap<String,(Instant,Option<Candidate>)>>,
     locks: Locks, cache_io: Mutex<()>, active: Active,
     prefetch: Arc<PrefetchQueue>,
+    youtube_blocked_until: Mutex<Option<Instant>>,
 }
 #[derive(Default)]
 struct PrefetchQueue {
@@ -72,6 +76,7 @@ impl AudioService {
             db,root,budget,binary,client:reqwest::Client::builder().timeout(Duration::from_secs(180)).connect_timeout(Duration::from_secs(8)).redirect(reqwest::redirect::Policy::none()).build().expect("valid HTTP client"),
             workers:Semaphore::new(foreground_workers),background_workers:Semaphore::new(background_workers),foreground:AtomicUsize::new(0),resolutions:Mutex::new(HashMap::new()),locks:Mutex::new(HashMap::new()),cache_io:Mutex::new(()),active:Arc::new(StdMutex::new(HashMap::new())),
             prefetch: prefetch.clone(),
+            youtube_blocked_until: Mutex::new(None),
         });
         for _ in 0..background_workers {
             let weak = Arc::downgrade(&service);
@@ -79,6 +84,9 @@ impl AudioService {
             tokio::spawn(async move {
                 loop {
                     let Some(service) = weak.upgrade() else { break; };
+                    let ready = queue.ready.notified();
+                    tokio::pin!(ready);
+                    ready.as_mut().enable();
                     let id = {
                         let mut jobs = queue.jobs.lock().unwrap();
                         jobs.pending.pop_front().map(|(id, _)| {
@@ -89,7 +97,7 @@ impl AudioService {
                     let Some(id) = id else {
                         drop(service);
                         tokio::select! {
-                            _ = queue.ready.notified() => {},
+                            _ = ready => {},
                             _ = tokio::time::sleep(Duration::from_secs(30)) => {},
                         }
                         continue;
@@ -98,7 +106,9 @@ impl AudioService {
                     let Ok(Some(track)) = sqlx::query_as::<_, Track>("SELECT * FROM tracks WHERE id=?")
                         .bind(&id).fetch_optional(&service.db).await else { continue; };
                     if service.cached(&id).await.ok().flatten().is_none() {
-                        let _ = service.resolve_priority(&track, true).await;
+                        if let Ok(Some(candidate)) = service.resolve_priority(&track, true).await {
+                            let _ = service.warm_start(&track, &candidate).await;
+                        }
                     }
                 }
             });
@@ -171,14 +181,14 @@ impl AudioService {
         let _guard=mutex.lock().await;
         {
             let map=self.resolutions.lock().await;
-            if let Some((at,result))=map.get(&t.id){if at.elapsed()<Duration::from_secs(if result.is_some(){600}else{12})&&result.as_ref().is_none_or(|c|!c.segmented&&candidate_unexpired(c)){return Ok(result.clone());}}
+            if let Some((at,result))=map.get(&t.id){if at.elapsed()<Duration::from_secs(600)&&result.as_ref().is_some_and(|c|(!c.segmented||!c.segments.is_empty())&&candidate_unexpired(c)){return Ok(result.clone());}}
         }
         let row=sqlx::query("SELECT candidate_json,expires_at FROM audio_resolutions WHERE track_id=?").bind(&t.id).fetch_optional(&self.db).await?;
         let previous=row.as_ref().and_then(|r|serde_json::from_str::<Candidate>(r.get::<&str,_>("candidate_json")).ok()).filter(|c|version_matches(&c.title,&t.title,&t.artist));
         if row.as_ref().is_some_and(|r|r.get::<i64,_>("expires_at")>now_seconds() as i64) {
-            if let Some(c)=previous.as_ref().filter(|c|!c.segmented){self.remember(&t.id,Some(c.clone())).await;return Ok(Some(c.clone()));}
+            if let Some(c)=previous.as_ref().filter(|c|candidate_unexpired(c) && (!c.segmented||!c.segments.is_empty())){self.remember(&t.id,Some(c.clone())).await;return Ok(Some(c.clone()));}
         }
-        let query=format!("{} {}",t.artist,crate::lyrics::clean_title(&t.title));
+        let query=format!("{} {}",t.artist,t.title);
         let search=async {
             let primary=async {
                 if let Some(old)=previous.as_ref().filter(|c|c.source=="soundcloud") {
@@ -187,15 +197,14 @@ impl AudioService {
                 self.lookup("soundcloud",&query,t,background).await.ok().flatten()
             };
             let backup=async {
-                // Prepare a backup while the primary is working, but never pick
-                // it ahead of an available SoundCloud result inside its budget.
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                // Give SoundCloud first access to the extractor when only one slot is available.
+                tokio::time::sleep(Duration::from_millis(150)).await;
                 if let Some(old)=previous.as_ref().filter(|c|c.source=="youtube") {
                     if let Ok(Some(c))=self.enrich(old.clone(),t,background).await{return Some(c);}
                 }
                 self.lookup("youtube",&query,t,background).await.ok().flatten()
             };
-            prefer_primary(primary,backup,Duration::from_secs(12)).await
+            prefer_primary(primary,backup,Duration::from_millis(700)).await
         };
         let resolution=async {
             if background {search.await} else {
@@ -205,7 +214,7 @@ impl AudioService {
                 tokio::select!{result=search=>result,result=self.wait_prepared(&t.id)=>Some(result)}
             }
         };
-        let result = tokio::time::timeout(Duration::from_secs(if background { 30 } else { 45 }), resolution).await;
+        let result = tokio::time::timeout(Duration::from_secs(if background { 18 } else { 24 }), resolution).await;
         let completed = result.is_ok();
         let best = result.ok().flatten();
         if let Some(c)=best.as_ref(){
@@ -215,7 +224,7 @@ impl AudioService {
             sqlx::query("INSERT INTO audio_resolutions (track_id,candidate_json,source_url,expires_at) VALUES (?,?,?,?) ON CONFLICT(track_id) DO UPDATE SET candidate_json=excluded.candidate_json,source_url=excluded.source_url,expires_at=excluded.expires_at,updated_at=CURRENT_TIMESTAMP")
                 .bind(&t.id).bind(value.to_string()).bind(&c.page_url).bind(expires as i64).execute(&self.db).await?;
         }
-        if completed { self.remember(&t.id,best.clone()).await; }
+        if completed && best.is_some() { self.remember(&t.id,best.clone()).await; }
         Ok(best)
     }
     async fn wait_prepared(&self,id:&str)->Candidate {
@@ -223,7 +232,7 @@ impl AudioService {
             tokio::time::sleep(Duration::from_millis(100)).await;
             let result=self.resolutions.lock().await.get(id).filter(|(at,c)|at.elapsed()<Duration::from_secs(600)&&c.as_ref().is_some_and(candidate_unexpired)).and_then(|(_,c)|c.clone());
             if let Some(c)=result {
-                if !c.segmented||self.cached(id).await.ok().flatten().is_some(){return c;}
+                if !c.segmented||!c.segments.is_empty(){return c;}
             }
         }
     }
@@ -241,7 +250,7 @@ impl AudioService {
             if let Ok(data)=self.run(&["-f",SOUNDCLOUD_FORMAT,"--dump-single-json",&target],background).await {
                 let value=data["entries"].as_array().and_then(|v|v.first()).unwrap_or(&data);
                 if let Some(c)=candidate(value,source,t) {
-                    if let Ok(Some(c))=self.ready(c,value,t).await{return Ok(Some(c));}
+                    if let Ok(Some(c))=self.ready(c,value,t,background).await{return Ok(Some(c));}
                 }
             }
         }
@@ -249,20 +258,20 @@ impl AudioService {
         // mismatched first hit must not consume the entire playback deadline.
         let target=format!("{}6:{query}",if source=="youtube"{"ytsearch"}else{"scsearch"});
         let data=self.run(&["--flat-playlist","--dump-single-json",&target],background).await?;
-        let mut choices:Vec<_>=data["entries"].as_array().into_iter().flatten().filter_map(|v|candidate(v,source,t)).collect();
+        let mut choices:Vec<_>=data["entries"].as_array().into_iter().flatten().filter_map(|v|candidate_from_metadata(v, source, t, false)).collect();
         choices.sort_by_key(|c|std::cmp::Reverse(c.score));
-        for c in choices.into_iter().take(3){if let Ok(Some(c))=self.enrich(c,t,background).await{return Ok(Some(c));}}
+        for c in choices.into_iter().take(4){if let Ok(Some(c))=self.enrich(c,t,background).await{return Ok(Some(c));}}
         Ok(None)
     }
     async fn enrich(&self,c:Candidate,t:&Track,background:bool)->Result<Option<Candidate>,()> {
         let format=if c.source=="soundcloud"{SOUNDCLOUD_FORMAT}else{"bestaudio[protocol=https]/bestaudio[protocol=http]/best[protocol=https]"};
         let data=self.run(&["--no-playlist","--js-runtimes","node","-f",format,"--dump-single-json",&c.page_url],background).await?;
-        let Some(c)=candidate(&data,&c.source,t)else{return Ok(None);};self.ready(c,&data,t).await
+        let Some(c)=candidate(&data,&c.source,t)else{return Ok(None);};self.ready(c,&data,t,background).await
     }
-    async fn ready(&self,mut c:Candidate,data:&Value,t:&Track)->Result<Option<Candidate>,()> {
+    async fn ready(&self,mut c:Candidate,data:&Value,t:&Track,background:bool)->Result<Option<Candidate>,()> {
         c.url=data["url"].as_str().unwrap_or("").into();if !allowed_media_url(&c.url){return Ok(None);}
         if data["protocol"]=="m3u8_native" && data["container"]=="m4a_dash" && c.source=="soundcloud" {
-            return self.cache_hls(c,t).await.map(Some);
+            return self.prepare_hls(c,t).await.map(Some);
         }
         c.content_type=match data["ext"].as_str(){Some("m4a"|"mp4")=>"audio/mp4",Some("webm")=>"audio/webm",Some("ogg"|"opus")=>"audio/ogg",Some("mp3")=>"audio/mpeg",_=>return Ok(None)}.into();
         let mut probe=tokio::time::timeout(Duration::from_secs(5),self.request(&c.url,Some("bytes=0-262143"),Method::GET)).await.map_err(|_|())?.map_err(|_|())?;
@@ -270,66 +279,162 @@ impl AudioService {
         if !probe.status().is_success()||!(kind.starts_with("audio/")||kind.starts_with("video/")||kind.starts_with("application/octet-stream")){return Ok(None);}
         c.byte_len=if probe.status()==StatusCode::PARTIAL_CONTENT{probe.headers().get(header::CONTENT_RANGE).and_then(|v|v.to_str().ok()).and_then(parse_content_range).filter(|(start,_,_)|*start==0).map(|(_,_,total)|total).unwrap_or(0)}else{probe.content_length().unwrap_or(0)};
         if c.byte_len==0||c.byte_len>MAX_FILE{return Ok(None);}
-        let take=c.byte_len.min(262144) as usize;
+        if !background { return Ok(Some(c)); }
+        let take=c.byte_len.min(START_BUFFER) as usize;
         let mut head=Vec::with_capacity(take);
         let read=async {while head.len()<take {let Some(chunk)=probe.chunk().await.map_err(|_|())?else{break;};head.extend_from_slice(&chunk[..chunk.len().min(take-head.len())]);}Ok::<_,()>(())};
-        if matches!(tokio::time::timeout(Duration::from_secs(4),read).await,Ok(Ok(())))&&head.len()==take {
-            let _io=self.cache_io.lock().await;let _=tokio::fs::create_dir_all(&self.root).await;
-            let temp=self.root.join(format!("{}.headtmp",t.id));
-            if tokio::fs::write(&temp,&head).await.is_ok()&&tokio::fs::rename(&temp,self.root.join(format!("{}.head",t.id))).await.is_ok(){
-                let _=sqlx::query("INSERT INTO audio_heads (track_id,stream_url,byte_len,head_size) VALUES (?,?,?,?) ON CONFLICT(track_id) DO UPDATE SET stream_url=excluded.stream_url,byte_len=excluded.byte_len,head_size=excluded.head_size,last_accessed_at=CURRENT_TIMESTAMP")
-                    .bind(&t.id).bind(&c.url).bind(c.byte_len as i64).bind(head.len() as i64).execute(&self.db).await;
-            }
-        }
+        let _ = tokio::time::timeout(Duration::from_secs(4), read).await;
+        if !head.is_empty() { self.save_head(t, &c, &head).await; }
         Ok(Some(c))
     }
-    async fn cache_hls(&self,mut c:Candidate,t:&Track)->Result<Candidate,()> {
-        c.segmented=true;
-        let response=self.request(&c.url,None,Method::GET).await.map_err(|_|())?;
-        if !response.status().is_success(){return Err(());}
-        let playlist=bounded_bytes(response,256*1024).await?;
-        let segments=hls_segments(std::str::from_utf8(&playlist).map_err(|_|())?,&c.url,c.duration).ok_or(())?;
-        let lock=self.lock(format!("file:{}",t.id)).await;let _writer=lock.lock().await;
-        if let Ok(Some((_,_,_,_)))=self.cached(&t.id).await{return Ok(c);}
-        let _active=self.active_guard(&t.id);
-        tokio::fs::create_dir_all(&self.root).await.map_err(|_|())?;
-        let partial=self.root.join(format!("{}.part",t.id));
-        let _partial=PartialGuard{path:partial.clone()};
-        let mut file=tokio::fs::File::create(&partial).await.map_err(|_|())?;
-        let mut downloads=futures_util::stream::iter(segments.into_iter().map(|url|async move {
-            let r=self.request(&url,None,Method::GET).await.map_err(|_|())?;
-            if !r.status().is_success(){return Err(());}
-            bounded_bytes(r,4*1024*1024).await
-        })).buffered(16);
-        let mut count=0u64;
-        while let Some(bytes)=downloads.next().await {
-            let bytes=bytes?;count+=bytes.len() as u64;
-            if count>MAX_FILE || count>self.budget{return Err(());}
-            file.write_all(&bytes).await.map_err(|_|())?;
+    async fn save_head(&self, t: &Track, c: &Candidate, head: &[u8]) {
+        let _io = self.cache_io.lock().await;
+        let _ = tokio::fs::create_dir_all(&self.root).await;
+        let temp = self.root.join(format!("{}.headtmp", t.id));
+        let _partial = PartialGuard { path: temp.clone() };
+        if tokio::fs::write(&temp, head).await.is_ok()
+            && tokio::fs::rename(&temp, self.root.join(format!("{}.head", t.id))).await.is_ok()
+        {
+            let _ = sqlx::query("INSERT INTO audio_heads (track_id,stream_url,byte_len,head_size) VALUES (?,?,?,?) ON CONFLICT(track_id) DO UPDATE SET stream_url=excluded.stream_url,byte_len=excluded.byte_len,head_size=excluded.head_size,last_accessed_at=CURRENT_TIMESTAMP")
+                .bind(&t.id).bind(&c.url).bind(c.byte_len as i64).bind(head.len() as i64).execute(&self.db).await;
         }
-        if count==0{return Err(());}
-        file.flush().await.map_err(|_|())?;drop(file);
-        c.byte_len=count;c.content_type="audio/mp4".into();
-        let _io=self.cache_io.lock().await;
-        tokio::fs::rename(&partial,self.path(&t.id)).await.map_err(|_|())?;
-        sqlx::query("INSERT INTO audio_cache (track_id,source_type,source_url,local_file_path,file_size_bytes,is_uncensored_score,content_type,source_title,duration_sec) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(track_id) DO UPDATE SET source_type=excluded.source_type,source_url=excluded.source_url,local_file_path=excluded.local_file_path,file_size_bytes=excluded.file_size_bytes,is_uncensored_score=excluded.is_uncensored_score,content_type=excluded.content_type,source_title=excluded.source_title,duration_sec=excluded.duration_sec,last_accessed_at=CURRENT_TIMESTAMP")
-            .bind(&t.id).bind(&c.source).bind(&c.page_url).bind(self.path(&t.id).to_string_lossy().to_string()).bind(count as i64).bind(c.score).bind(&c.content_type).bind(&c.title).bind(c.duration).execute(&self.db).await.map_err(|_|())?;
+    }
+    async fn prepare_hls(&self, mut c: Candidate, t: &Track) -> Result<Candidate, ()> {
+        let fetch_playlist = async {
+            let response = self.request(&c.url, None, Method::GET).await.map_err(|_| ())?;
+            if !response.status().is_success() { return Err(()); }
+            bounded_bytes(response, 256 * 1024).await
+        };
+        let playlist = tokio::time::timeout(Duration::from_secs(5), fetch_playlist).await.map_err(|_| ())??;
+        c.segments = hls_segments(std::str::from_utf8(&playlist).map_err(|_| ())?, &c.url, c.duration).ok_or(())?;
+        c.segmented = true;
+        c.content_type = "audio/mp4".into();
+        let (mut init, first) = tokio::try_join!(
+            self.fetch_segment(&c.segments[0]), self.fetch_segment(&c.segments[1])
+        ).map_err(|_| ())?;
+        init.extend(first);
+        self.save_head(t, &c, &init).await;
         Ok(c)
     }
+    async fn warm_start(&self, track: &Track, candidate: &Candidate) -> Result<(), ()> {
+        if candidate.segmented || self.head(track, candidate).await.is_some() { return Ok(()); }
+        let limit = START_BUFFER.min(candidate.byte_len);
+        if limit == 0 { return Err(()); }
+        let fetch = async {
+            let (response, end) = self.fragment(candidate, 0, limit - 1).await.map_err(|_| ())?;
+            if end >= START_BUFFER { return Err(()); }
+            bounded_bytes(response, START_BUFFER as usize).await
+        };
+        let bytes = tokio::time::timeout(Duration::from_secs(4), fetch).await.map_err(|_| ())??;
+        if !bytes.is_empty() { self.save_head(track, candidate, &bytes).await; }
+        Ok(())
+    }
+    async fn fetch_segment(&self, url: &str) -> Result<Vec<u8>, std::io::Error> {
+        for _ in 0..2 {
+            let fetch = async {
+                let response = self.request(url, None, Method::GET).await.map_err(|_| ())?;
+                if !response.status().is_success() { return Err(()); }
+                bounded_bytes(response, 4 * 1024 * 1024).await
+            };
+            if let Ok(Ok(bytes)) = tokio::time::timeout(Duration::from_secs(5), fetch).await {
+                if !bytes.is_empty() { return Ok(bytes); }
+            }
+        }
+        Err(std::io::Error::other("audio segment unavailable"))
+    }
+    async fn stream_hls(self: &Arc<Self>, t: &Track, c: Candidate, request: Request<Body>) -> Result<Response, ApiError> {
+        // A fragmented MP4 can play while it arrives. Its total byte length is
+        // known only after assembly, so Range is available from the disk cache.
+        let response = Response::builder().header(header::CONTENT_TYPE, "audio/mp4")
+            .header(header::CACHE_CONTROL, "no-store").header("x-yamusic-mode", "full");
+        if request.method() == Method::HEAD {
+            return response.body(Body::empty()).map_err(|_| media_error("head response failed"));
+        }
+        let head = if let Some(head) = self.head(t, &c).await {
+            head
+        } else {
+            let (mut init, first) = tokio::try_join!(
+                self.fetch_segment(&c.segments[0]), self.fetch_segment(&c.segments[1])
+            ).map_err(|_| media_error("audio start unavailable"))?;
+            init.extend(first);
+            init.into()
+        };
+        let lock = self.lock(format!("file:{}", t.id)).await;
+        let writer = lock.try_lock_owned().ok();
+        let partial = self.root.join(format!("{}.part", t.id));
+        let file = if writer.is_some() {
+            let _ = tokio::fs::create_dir_all(&self.root).await;
+            tokio::fs::File::create(&partial).await.ok()
+        } else { None };
+        let part = file.as_ref().map(|_| PartialGuard { path: partial });
+        let service = self.clone();
+        let remaining = c.segments.len() - 1;
+        let segments = futures_util::stream::iter(c.segments[2..].to_vec().into_iter().map(move |url| {
+            let service = service.clone();
+            async move { service.fetch_segment(&url).await.map(axum::body::Bytes::from) }
+        })).buffered(3);
+        let active = self.active_guard(&t.id);
+        let state = StreamState {
+            file, upstream: None, head: None, service: self.clone(), track: t.clone(),
+            candidate: c, count: 0, length: None, position: 0, end: 0, segment_end: 0,
+            retries: 0, _part: part, _writer: writer, _active: active,
+        };
+        let body = futures_util::stream::try_unfold(
+            (state, Some(head), Box::pin(segments), remaining),
+            |(mut state, head, mut segments, remaining)| async move {
+                let chunk = match head {
+                    Some(bytes) => bytes,
+                    None => match segments.next().await {
+                        Some(result) => result?,
+                        None => return Ok::<_, std::io::Error>(None),
+                    }
+                };
+                state.count += chunk.len() as u64;
+                if state.count > MAX_FILE { return Err(std::io::Error::other("audio exceeds size limit")); }
+                if let Some(file) = state.file.as_mut() {
+                    if state.count > state.service.budget || file.write_all(&chunk).await.is_err() {
+                        state.file = None;
+                    }
+                }
+                if remaining == 1 { state.finish().await; }
+                Ok(Some((chunk, (state, None, segments, remaining - 1))))
+            }
+        );
+        response.body(Body::from_stream(body)).map_err(|_| media_error("invalid audio response"))
+    }
     async fn run(&self,args:&[&str],background:bool)->Result<Value,()> {
+        let youtube = args.last().is_some_and(|target| target.starts_with("ytsearch") || target.starts_with("https://www.youtube.com/") || target.starts_with("https://youtube.com/"));
+        if youtube && self.youtube_blocked_until.lock().await.is_some_and(|until| until > Instant::now()) { return Err(()); }
         let pool=if background{&self.background_workers}else{&self.workers};
         // A 1-worker VPS must allow the speculative backup to wait for an
         // in-flight extractor; the whole resolution still has its own deadline.
         let _permit=tokio::time::timeout(Duration::from_secs(35),pool.acquire()).await.map_err(|_|())?.map_err(|_|())?;
+        if youtube && self.youtube_blocked_until.lock().await.is_some_and(|until| until > Instant::now()) { return Err(()); }
         let mut command=Command::new(&self.binary);
         command.args(["--ignore-config","--no-warnings","--skip-download","--socket-timeout","6","--retries","0","--no-progress"])
-            .args(args).stdin(Stdio::null()).stderr(Stdio::null()).stdout(Stdio::piped()).kill_on_drop(true);
+            .args(args).stdin(Stdio::null()).stderr(Stdio::piped()).stdout(Stdio::piped()).kill_on_drop(true);
         #[cfg(windows)] command.creation_flags(0x08000000);
         let mut child=command.spawn().map_err(|_|())?;let stdout=child.stdout.take().ok_or(())?;let mut buffer=Vec::new();
-        let result=tokio::time::timeout(Duration::from_secs(30),stdout.take(6*1024*1024+1).read_to_end(&mut buffer)).await;
-        if !matches!(result,Ok(Ok(_)))||buffer.len()>6*1024*1024{tracing::warn!(background,"Audio extractor timed out or exceeded output limit");let _=child.kill().await;return Err(());}
+        let stderr = child.stderr.take().ok_or(())?;
+        let mut errors = Vec::new();
+        let read = async {
+            let mut stdout = stdout.take(6 * 1024 * 1024 + 1);
+            let mut stderr = stderr.take(64 * 1024 + 1);
+            tokio::try_join!(
+                stdout.read_to_end(&mut buffer),
+                stderr.read_to_end(&mut errors)
+            )
+        };
+        let result=tokio::time::timeout(Duration::from_secs(12),read).await;
+        if !matches!(result,Ok(Ok(_)))||buffer.len()>6*1024*1024||errors.len()>64*1024{tracing::warn!(background,"Audio extractor timed out or exceeded output limit");let _=child.kill().await;return Err(());}
         let status=tokio::time::timeout(Duration::from_secs(2),child.wait()).await.map_err(|_|())?.map_err(|_|())?;
-        if !status.success(){tracing::warn!(background,code=?status.code(),"Audio extractor failed");return Err(());}serde_json::from_slice(&buffer).map_err(|_|())
+        if !status.success() {
+            let sign_in_required = youtube && String::from_utf8_lossy(&errors).contains("Sign in to confirm");
+            if sign_in_required { *self.youtube_blocked_until.lock().await = Some(Instant::now() + Duration::from_secs(60)); }
+            tracing::warn!(background, sign_in_required, code=?status.code(), "Audio extractor failed");
+            return Err(());
+        }
+        serde_json::from_slice(&buffer).map_err(|_| ())
     }
     async fn head(&self,t:&Track,c:&Candidate)->Option<axum::body::Bytes> {
         let _io=self.cache_io.lock().await;
@@ -375,10 +480,21 @@ impl AudioService {
             self.invalidate(&t.id).await?;
         }
         if let Some(candidate)=self.resolve(t).await? {
-            // HLS preparation produces a complete local fMP4, with Range support.
             if self.cached(&t.id).await?.is_some(){return Box::pin(self.stream(t,request)).await;}
-            if candidate.segmented{return Err(media_error("prepared audio cache was removed"));}
-            return self.stream_full(t,candidate,request).await;
+            let retry = !request.uri().query().is_some_and(|q| q.split('&').any(|p| p == "refresh=1"));
+            let mut renewal = Request::builder().method(request.method()).uri("/?refresh=1");
+            if let Some(range) = request.headers().get(header::RANGE) {
+                renewal = renewal.header(header::RANGE, range);
+            }
+            let response = if candidate.segmented {
+                self.stream_hls(t, candidate, request).await
+            } else {
+                self.stream_full(t, candidate, request).await
+            };
+            if retry && response.as_ref().is_err_and(|error| error.status.is_server_error()) {
+                return Box::pin(self.stream(t, renewal.body(Body::empty()).map_err(|_| media_error("invalid retry"))?)).await;
+            }
+            return response;
         }
         Err(ApiError::full_audio_unavailable())
     }
@@ -413,8 +529,11 @@ impl AudioService {
             .header(header::CONTENT_TYPE,&c.content_type).header(header::ACCEPT_RANGES,"bytes").header(header::CONTENT_LENGTH,length).header("x-yamusic-mode","full");
         if range.is_some(){response=response.header(header::CONTENT_RANGE,format!("bytes {start}-{end}/{}",c.byte_len));}
         if request.method()==Method::HEAD{return response.body(Body::empty()).map_err(|_|media_error("head response failed"));}
-        let head=if start==0{self.head(t,&c).await}else{None};
-        let (upstream,segment_end)=if head.is_some(){(None,0)}else{let (response,end)=self.fragment(&c,start,end.min(start.saturating_add(262143))).await?;(Some(response),end)};
+        let head=if start < START_BUFFER {
+            self.head(t,&c).await.filter(|head| start < head.len() as u64).map(|head| head.slice(start as usize..))
+        } else { None };
+        let (upstream,segment_end)=if head.is_some(){(None,0)}else{let first = self.fragment(&c,start,end.min(start.saturating_add(STREAM_WINDOW - 1)));
+            let (response,end)=tokio::time::timeout(Duration::from_secs(5), first).await.map_err(|_|media_error("audio startup timeout"))??;(Some(response),end)};
         let lock=self.lock(format!("file:{}",t.id)).await;
         let write_guard=if start==0&&end+1==c.byte_len&&c.byte_len<=self.budget{lock.try_lock_owned().ok()}else{None};
         let file=if write_guard.is_some(){tokio::fs::create_dir_all(&self.root).await.ok();tokio::fs::File::create(self.root.join(format!("{}.part",t.id))).await.ok()}else{None};
@@ -493,7 +612,7 @@ fn stream_body(state:StreamState)->Body {
                     if state.position>state.end{state.finish().await;}return Ok(Some((chunk,state)));
                 }
                 if state.upstream.is_none(){
-                    let (response,end)=state.service.fragment(&state.candidate,state.position,state.end.min(state.position.saturating_add(262143))).await.map_err(|_|std::io::Error::other("audio reconnect failed"))?;
+                    let (response,end)=state.service.fragment(&state.candidate,state.position,state.end.min(state.position.saturating_add(STREAM_WINDOW - 1))).await.map_err(|_|std::io::Error::other("audio reconnect failed"))?;
                     state.upstream=Some(response);state.segment_end=end;
                 }
                 match state.upstream.as_mut().unwrap().chunk().await {
@@ -605,22 +724,28 @@ fn version_matches(title:&str,expected:&str,artist:&str)->bool {
     true
 }
 pub fn candidate(v:&Value,source:&str,t:&Track)->Option<Candidate> {
-    let title=v["title"].as_str()?;let artist=v["artist"].as_str().or(v["uploader"].as_str()).unwrap_or("");
-    let duration=v["duration"].as_f64()?;if !duration.is_finite()||(duration-t.duration_sec as f64).abs()>4.0{return None;}
+    candidate_from_metadata(v, source, t, true)
+}
+fn candidate_from_metadata(v:&Value,source:&str,t:&Track,complete:bool)->Option<Candidate> {
+    let title=v["title"].as_str()?;let artist=v["artist"].as_str().or(v["uploader"].as_str()).or(v["channel"].as_str()).unwrap_or("");
+    let reported_duration = v["duration"].as_f64();
+    let duration = reported_duration.unwrap_or(t.duration_sec as f64);
+    if (complete && reported_duration.is_none()) || !duration.is_finite() || (duration-t.duration_sec as f64).abs()>4.0{return None;}
     let lowered=title.to_lowercase();let expected=t.title.to_lowercase();
     if !version_matches(title,&expected,&t.artist){return None;}
     let original=normalized(&crate::lyrics::clean_title(&t.title));let name=normalized(title);
     if original.is_empty()||!name.contains(&original){return None;}
-    let requested_artist=normalized(&t.artist);if requested_artist.is_empty()||!normalized(&format!("{title} {artist}")).contains(&requested_artist){return None;}
+    let requested_artist=normalized(&t.artist);if requested_artist.is_empty() || (complete && !normalized(&format!("{title} {artist}")).contains(&requested_artist)){return None;}
     let page=v["webpage_url"].as_str().or(v["url"].as_str())?;
     let valid_page=reqwest::Url::parse(page).ok().is_some_and(|url|url.scheme()=="https"&&url.host_str().is_some_and(|h|h=="www.youtube.com"||h=="youtube.com"||h=="soundcloud.com"||h=="api.soundcloud.com"));
     if !valid_page{return None;}
     let date=v["upload_date"].as_str().map(str::to_owned);
     let mut score=50-(duration-t.duration_sec as f64).abs().round() as i32*3;
+    if !complete && normalized(&format!("{title} {artist}")).contains(&requested_artist) { score += 40; }
     if date.as_ref().is_some_and(|d|d.len()==8&&d.chars().all(|c|c.is_ascii_digit())&&d.as_str()<"20260301"){score+=50;}
     if ["uncensored","без цензуры","explicit","original"].iter().any(|w|lowered.contains(w)){score+=30;}
     if lowered.contains("official audio"){score+=15;}if lowered.contains("official video"){score-=10;}
-    Some(Candidate{source:source.into(),page_url:page.into(),title:title.into(),artist:artist.into(),duration,upload_date:date,score,url:String::new(),content_type:"audio/mpeg".into(),byte_len:0,segmented:false})
+    Some(Candidate{source:source.into(),page_url:page.into(),title:title.into(),artist:artist.into(),duration,upload_date:date,score,url:String::new(),content_type:"audio/mpeg".into(),byte_len:0,segmented:false,segments:Vec::new()})
 }
 pub fn allowed_media_url(value:&str)->bool {
     reqwest::Url::parse(value).ok().is_some_and(|u|u.scheme()=="https"&&u.username().is_empty()&&u.password().is_none()&&u.port_or_known_default()==Some(443)&&u.host_str().is_some_and(|host|["googlevideo.com","sndcdn.com","soundcloud.com","soundcloud.cloud","dzcdn.net"].iter().any(|suffix|host==*suffix||host.ends_with(&format!(".{suffix}")))))

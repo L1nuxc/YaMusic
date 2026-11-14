@@ -45,30 +45,63 @@ pub async fn get(State(state): State<AppState>, Path(id): Path<String>) -> Resul
     }
     let title = clean_title(&t.title);
     let base = state.lyrics_base.trim_end_matches('/');
-    let mut found = None;
-    // Exact match includes the original duration, never the length of a preview.
-    for title in [&t.title, &title] {
-        let response = state.client.get(format!("{base}/api/get"))
-            .query(&[("track_name",title.as_str()),("artist_name",t.artist.as_str()),("album_name",t.album.as_str()),("duration",&t.duration_sec.to_string())])
-            .send().await.map_err(ApiError::upstream)?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND { continue; }
-        if !response.status().is_success() { return Err(ApiError::provider("lyrics provider unavailable".into())); }
-        let data: Value = response.json().await.map_err(ApiError::upstream)?;
-        if matches(&data,&t) { found=Some(data); break; }
-    }
-    if found.is_none() {
-        let response=state.client.get(format!("{base}/api/search")).query(&[("track_name",title.as_str()),("artist_name",t.artist.as_str())]).send().await.map_err(ApiError::upstream)?;
+    let exact = async {
+        for name in std::iter::once(t.title.as_str()).chain((title != t.title).then_some(title.as_str())) {
+            let response = state.client.get(format!("{base}/api/get"))
+                .query(&[("track_name", name), ("artist_name", t.artist.as_str()), ("album_name", t.album.as_str()), ("duration", &t.duration_sec.to_string())])
+                .timeout(std::time::Duration::from_secs(4)).send().await.map_err(ApiError::upstream)?;
+            if response.status() == reqwest::StatusCode::NOT_FOUND { continue; }
+            if !response.status().is_success() { return Err(ApiError::provider("lyrics provider unavailable".into())); }
+            let data: Value = response.json().await.map_err(ApiError::upstream)?;
+            if matches(&data, &t) { return Ok(Some(data)); }
+        }
+        Ok(None)
+    };
+    let search = async {
+        let response = state.client.get(format!("{base}/api/search"))
+            .query(&[("track_name", title.as_str()), ("artist_name", t.artist.as_str())])
+            .timeout(std::time::Duration::from_secs(5)).send().await.map_err(ApiError::upstream)?;
         if !response.status().is_success() { return Err(ApiError::provider("lyrics search unavailable".into())); }
-        let data:Value=response.json().await.map_err(ApiError::upstream)?;
-        found=data.as_array().and_then(|list| list.iter().filter(|v| matches(v,&t)).max_by_key(|v| (text(v,"syncedLyrics").is_some(),v["albumName"].as_str()==Some(t.album.as_str()))).cloned());
-    }
+        let data: Value = response.json().await.map_err(ApiError::upstream)?;
+        Ok(data.as_array().and_then(|list| list.iter().filter(|v| matches(v, &t))
+            .max_by_key(|v| (text(v, "syncedLyrics").is_some(), v["albumName"].as_str() == Some(t.album.as_str()))).cloned()))
+    };
+    tokio::pin!(exact);
+    let found = tokio::select! {
+        result = &mut exact => match result {
+            Ok(Some(data)) => Some(data),
+            other => prefer_lyrics(other, search.await)?,
+        },
+        _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {
+            tokio::pin!(search);
+            tokio::select! {
+                biased;
+                result = &mut exact => match result {
+                    Ok(Some(data)) => Some(data),
+                    other => prefer_lyrics(other, search.await)?,
+                },
+                result = &mut search => match result {
+                    Ok(Some(data)) if data["albumName"].as_str() == Some(t.album.as_str()) => Some(data),
+                    other => prefer_lyrics(exact.await, other)?,
+                },
+            }
+        },
+    };
     let (synced_lrc,plain_lyrics,instrumental,provider_id)=if let Some(data)=found {
         (text(&data,"syncedLyrics"),text(&data,"plainLyrics"),data["instrumental"].as_bool().unwrap_or(false),data["id"].as_i64())
     } else { (None,None,false,None) };
     sqlx::query("INSERT INTO lyrics_cache (track_id,synced_lrc,plain_lyrics,instrumental,provider_id,fetched_at) VALUES (?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(track_id) DO UPDATE SET translated_lrc=CASE WHEN synced_lrc IS excluded.synced_lrc THEN translated_lrc ELSE NULL END,synced_lrc=excluded.synced_lrc,plain_lyrics=excluded.plain_lyrics,instrumental=excluded.instrumental,provider_id=excluded.provider_id,fetched_at=CURRENT_TIMESTAMP")
         .bind(&t.id).bind(&synced_lrc).bind(&plain_lyrics).bind(instrumental).bind(provider_id).execute(&state.db).await?;
-    Ok(Json(Lyrics { track_id:t.id,status:status(&synced_lrc,&plain_lyrics,instrumental).into(),synced_lrc,plain_lyrics,instrumental,provider_id,source:"lrclib".into() }))
+    Ok(Json(Lyrics { track_id:t.id.clone(),status:status(&synced_lrc,&plain_lyrics,instrumental).into(),synced_lrc,plain_lyrics,instrumental,provider_id,source:"lrclib".into() }))
 }
+fn prefer_lyrics(exact: Result<Option<Value>, ApiError>, search: Result<Option<Value>, ApiError>) -> Result<Option<Value>, ApiError> {
+    match (exact, search) {
+        (Ok(Some(data)), _) | (_, Ok(Some(data))) => Ok(Some(data)),
+        (Ok(None), Ok(None)) => Ok(None),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+    }
+}
+
 #[derive(Serialize)]
 pub struct Translation {
     translated_lrc: String,

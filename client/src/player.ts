@@ -116,6 +116,7 @@ export class Player extends EventTarget {
       }
       this.tick();
     });
+    on('progress', () => this.dispatchEvent(new Event('bufferprogress')));
     on('timeupdate', () => { this.tick(); this.updateCrossfade(); });
     on('seeking', () => { this.cancelCrossfade(); this.listening.anchor(this.time,performance.now()); });
     on('seeked', () => {
@@ -224,8 +225,9 @@ export class Player extends EventTarget {
     if (this.mode === 'unavailable') { this.load(); return; }
     this.connectVisualAudio();
     const attempt = this.sequence;
+    const source = this.audio.src;
     void this.audio.play().catch((error: DOMException) => {
-      if (attempt !== this.sequence || error.name === 'AbortError') return;
+      if (attempt !== this.sequence || source !== this.audio.src || error.name === 'AbortError') return;
       this.loading = false; this.playing = false; this.change();
       if (error.name === 'NotAllowedError') this.dispatchEvent(new CustomEvent('playererror', { detail: 'Нажмите воспроизведение ещё раз, чтобы браузер разрешил звук.' }));
     });

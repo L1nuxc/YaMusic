@@ -42,7 +42,7 @@ pub(crate) async fn match_candidates(state: &AppState, candidates: Vec<Candidate
             None => missing.push(candidate),
         }
     }
-    enrich_tracks(state, &mut tracks).await?;
+    enrich_tracks(state, &mut tracks, false).await?;
     save_tracks(&state.db, &tracks).await?;
     Ok((tracks,missing))
 }

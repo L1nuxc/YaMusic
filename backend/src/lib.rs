@@ -65,7 +65,7 @@ impl AppState {
     async fn catalog(&self, path: &str, params: &[(&str, String)]) -> Result<Value, ApiError> {
         let key = format!("{path}:{params:?}");
         if let Some((at, value)) = self.cache.lock().await.get(&key) {
-            if at.elapsed() < Duration::from_secs(60) { return Ok(value.clone()); }
+            if at.elapsed() < catalog_ttl(path) { return Ok(value.clone()); }
         }
         let _permit = tokio::time::timeout(Duration::from_secs(3), self.concurrency.acquire()).await.map_err(|_| ApiError::busy())?.map_err(|_| ApiError::busy())?;
         let response = self.client.get(format!("{}{path}", self.base)).query(params).send().await.map_err(ApiError::upstream)?;
@@ -77,13 +77,17 @@ impl AppState {
             return Err(ApiError::provider(error.to_string()));
         }
         let mut cache = self.cache.lock().await;
-        cache.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(60));
+        cache.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(600));
         if cache.len() >= 128 {
             if let Some(oldest) = cache.iter().min_by_key(|(_, (at, _))| *at).map(|(key, _)| key.clone()) { cache.remove(&oldest); }
         }
         cache.insert(key, (Instant::now(), data.clone()));
         Ok(data)
     }
+}
+
+fn catalog_ttl(path: &str) -> Duration {
+    Duration::from_secs(if path.starts_with("/search/") { 60 } else { 600 })
 }
 
 pub async fn connect_database(url: &str) -> Result<SqlitePool, sqlx::Error> {
@@ -231,7 +235,7 @@ async fn save_tracks(db: &SqlitePool, tracks: &[Track]) -> Result<(), ApiError> 
 /// Compact catalog responses omit contributors. Reuse stored credits first,
 /// then fetch details with bounded parallelism and a strict page-time budget.
 /// Audio startup never waits for this metadata enrichment.
-async fn enrich_tracks(state: &AppState, tracks: &mut [Track]) -> Result<(), ApiError> {
+async fn enrich_tracks(state: &AppState, tracks: &mut [Track], fetch_missing: bool) -> Result<(), ApiError> {
     if tracks.is_empty() { return Ok(()); }
     let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new("SELECT * FROM tracks WHERE id IN (");
     let mut ids = query.separated(",");
@@ -244,6 +248,7 @@ async fn enrich_tracks(state: &AppState, tracks: &mut [Track]) -> Result<(), Api
             if let Some(credits) = stored.get(&track.id) { track.contributors = credits.clone(); }
         }
     }
+    if !fetch_missing { return Ok(()); }
     let missing: Vec<_> = tracks.iter().enumerate().filter(|(_,t)|t.contributors.is_empty()).take(50).map(|(i,t)|(i,t.deezer_id)).collect();
     let mut requests = future_stream::iter(missing.into_iter().map(|(index,id)| async move {
         let data = state.catalog(&format!("/track/{id}"), &[]).await.ok()?;
@@ -280,7 +285,7 @@ async fn health(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
 }
 
 #[derive(Deserialize)]
-struct SearchParams { q: String, #[serde(rename="type", default)] kind: String, limit: Option<u16>, index: Option<u32> }
+struct SearchParams { q: String, #[serde(rename="type", default)] kind: String, limit: Option<u16>, index: Option<u32>, #[serde(default)] compact: bool }
 async fn search(State(state): State<AppState>, Query(params): Query<SearchParams>) -> Result<Json<SearchResults>, ApiError> {
     let q = params.q.trim();
     if q.is_empty() || q.chars().count() > 200 { return Err(ApiError::bad_request("Введите от 1 до 200 символов.")); }
@@ -304,7 +309,7 @@ async fn search(State(state): State<AppState>, Query(params): Query<SearchParams
         artists: items(&artists).iter().map(normalize_artist).collect(),
         total: [&tracks,&albums,&artists].iter().map(|v| v["total"].as_u64().unwrap_or(0)).sum(), source: "deezer".into(),
     };
-    enrich_tracks(&state, &mut result.tracks).await?;
+    enrich_tracks(&state, &mut result.tracks, !params.compact).await?;
     save_tracks(&state.db, &result.tracks).await?;
     state.analysis.enqueue(result.tracks.iter().map(|t|t.id.clone()),false);
     save_entities(&state.db, &result.artists, &result.albums).await?;
@@ -322,25 +327,29 @@ async fn track(State(state): State<AppState>, Path(id): Path<String>) -> Result<
     save_tracks(&state.db, std::slice::from_ref(&track)).await?;
     Ok(Json(track))
 }
-async fn album(State(state): State<AppState>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
+#[derive(Deserialize)]
+struct DetailParams { #[serde(default)] compact: bool }
+async fn album(State(state): State<AppState>, Path(id): Path<String>, Query(params): Query<DetailParams>) -> Result<Json<Value>, ApiError> {
     let id = parse_id(&id)?;
     let data = state.catalog(&format!("/album/{id}"), &[]).await?;
     let album = normalize_album(&data);
     let mut tracks = album_tracks(&data);
-    enrich_tracks(&state, &mut tracks).await?;
+    enrich_tracks(&state, &mut tracks, !params.compact).await?;
     save_tracks(&state.db, &tracks).await?;
     save_entities(&state.db, &[], std::slice::from_ref(&album)).await?;
     state.audio.prefetch(tracks.iter().take(3).map(|t|t.id.clone()));
     Ok(Json(json!({"album":album,"tracks":tracks,"source":"deezer"})))
 }
 fn album_tracks(data: &Value) -> Vec<Track> {
+    let mut album = data.clone();
+    if let Some(fields) = album.as_object_mut() { fields.remove("tracks"); }
     items(&data["tracks"]).iter().take(100).filter_map(|v| {
-        let mut v = v.clone(); v["album"] = data.clone();
+        let mut v = v.clone(); v["album"] = album.clone();
         if v["artist"]["name"].as_str().is_none() { v["artist"] = data["artist"].clone(); }
         normalize_track(&v)
     }).collect()
 }
-async fn artist(State(state): State<AppState>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
+async fn artist(State(state): State<AppState>, Path(id): Path<String>, Query(params): Query<DetailParams>) -> Result<Json<Value>, ApiError> {
     let id = parse_id(&id)?;
     let detail_path = format!("/artist/{id}");
     let top_path = format!("/artist/{id}/top");
@@ -356,7 +365,7 @@ async fn artist(State(state): State<AppState>, Path(id): Path<String>) -> Result
     let mut tracks: Vec<_> = items(&top).iter().filter_map(normalize_track).collect();
     let albums: Vec<_> = items(&albums).iter().map(|v| { let mut v = v.clone(); if v["artist"].is_null(){v["artist"] = data.clone();} normalize_album(&v) }).collect();
     let expand = tracks.len() < 10;
-    if expand {
+    if expand && !params.compact {
         // Some artist/top endpoints contain only one or two songs despite an
         // extensive discography. Inspect releases, preserving exact artist IDs.
         let mut releases = future_stream::iter(albums.clone().into_iter().take(12).enumerate().map(|(index,a): (usize,Album)| {
@@ -374,13 +383,13 @@ async fn artist(State(state): State<AppState>, Path(id): Path<String>) -> Result
     let mut seen = std::collections::HashSet::new();
     tracks.retain(|t|seen.insert(t.id.clone()));
     tracks.truncate(100);
-    enrich_tracks(&state,&mut tracks).await?;
+    enrich_tracks(&state,&mut tracks,!params.compact).await?;
     // Guests belong to this discography too; unrelated namesakes do not.
     tracks.retain(|t|t.artist_id==id || t.contributors.iter().any(|credit|credit.id==id));
     tracks.truncate(30);
     save_tracks(&state.db, &tracks).await?;
     save_entities(&state.db, std::slice::from_ref(&artist), &albums).await?;
-    Ok(Json(json!({"artist":artist,"tracks":tracks,"albums":albums,"source":"deezer","tracks_source":if expand{"top_and_discography"}else{"top"}})))
+    Ok(Json(json!({"artist":artist,"tracks":tracks,"albums":albums,"source":"deezer","tracks_source":if expand && !params.compact{"top_and_discography"}else{"top"},"more_tracks":expand && params.compact})))
 }
 async fn preview(State(state): State<AppState>, Path(id): Path<String>) -> Result<Response, ApiError> {
     let Json(track) = track(State(state), Path(id)).await?;
