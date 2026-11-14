@@ -1,0 +1,1 @@
+ALTER TABLE daily_mixes ADD COLUMN algorithm_version INTEGER NOT NULL DEFAULT 0;

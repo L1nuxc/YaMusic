@@ -1,0 +1,26 @@
+[Unit]
+Description=YaMusic web and audio server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=yamusic
+Group=yamusic
+WorkingDirectory=/opt/yamusic/app
+EnvironmentFile=/etc/yamusic/env
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/opt/yamusic/bin/yamusic-server
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/yamusic/data /opt/yamusic/.cache
+MemoryMax=800M
+MemorySwapMax=2G
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
