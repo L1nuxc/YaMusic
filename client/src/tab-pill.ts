@@ -2,6 +2,7 @@ import { interfaceMotion, springFrames } from './springs.ts';
 
 const lead = springFrames(620, 40, 500);
 const trail = springFrames(170, 19, 500);
+const sidebarHighlight = springFrames(380, 28, 420);
 const running = new WeakMap<HTMLElement, Animation>();
 
 export function syncTabPill(group: HTMLElement, animate = false): void {
@@ -33,6 +34,10 @@ export function syncTabPill(group: HTMLElement, animate = false): void {
   pill.style[size] = `${length}px`;
   if (!animate || !oldLength || !interfaceMotion() || (from === target && oldLength === length)) return;
 
+  if (vertical) {
+    running.set(group, pill.animate(sidebarHighlight.map(p => ({ top: `${from + (target - from) * p}px` })), 420));
+    return;
+  }
   const starts = target >= from ? trail : lead;
   const ends = target >= from ? lead : trail;
   const animation = pill.animate(starts.map((progress, i) => {

@@ -15,14 +15,29 @@ import { parseSpotifyExport, type SpotifyExportPlaylist } from './spotify-export
 import { animateDropdown, mountSpringSelect, mountSpringSwitch } from './spring-controls.ts';
 import { jellySlider, mountJellySlider } from './jelly-slider.ts';
 import { mountPillGroups, selectPillButton, syncTabPill } from './tab-pill.ts';
-import { mountPlayerRanges, playerRange } from './player-range.ts';
+import { mountPlayerRanges, playerRange, showCurrentVolume } from './player-range.ts';
 import { mountCoverParallax } from './cover-parallax.ts';
+import { mountSidebar } from './sidebar.ts';
+import { animateDeck, animateLyric, animatePlayerButton, scrollToLyric, stopLyricsScroll } from './player-motion.ts';
+import { interfaceMotion } from './springs.ts';
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
 const dialog = document.querySelector<HTMLDialogElement>('#dialog')!;
 let library = restoreLibrary(localStorage.getItem(STORAGE_KEY));
 const player = new Player(library.settings.volume);
 player.setCrossfade(library.settings.crossfade);
+const playbackModesKey = 'yamusic.playback-modes.v1';
+try {
+  const modes = JSON.parse(localStorage.getItem(playbackModesKey) ?? 'null');
+  player.shuffle = modes?.shuffle === true;
+  if (modes?.repeat === 'one' || modes?.repeat === 'all') player.repeat = modes.repeat;
+} catch { /* Keep the playback defaults if storage is unavailable. */ }
+
+function savePlaybackModes(): void {
+  try {
+    localStorage.setItem(playbackModesKey, JSON.stringify({ shuffle: player.shuffle, repeat: player.repeat }));
+  } catch { /* Playback can continue without storage. */ }
+}
 const tracks = new Map<string, Track>();
 let discovery: Track[] = [];
 let discoveryPromise: Promise<Track[]> | undefined;
@@ -189,9 +204,12 @@ app.innerHTML = `
   <a class="skip-link" href="#main" hidden>Перейти к содержимому</a>
   <div class="app-shell" hidden>
     <aside class="sidebar" aria-label="Боковое меню">
-      <a class="brand" href="#/home" aria-label="YaMusic — главная">${icon('audio-lines')}<span>YaMusic<span class="brand-dot">.</span></span></a>
-      <nav class="desktop-navigation tab-pill-group" aria-label="Основная навигация">${navItems.map(n => `<a href="#/${n.page}" data-page="${n.page}" class="navigation-link">${icon(n.glyph)}<span>${n.label}</span></a>`).join('')}</nav>
-      <div class="settings-account"><a href="#/settings" data-page="settings">${icon('settings-2')}<span>Настройки</span></a><button data-action="account" data-account-avatar aria-label="Мой аккаунт" title="Мой аккаунт">${accountAvatar()}</button></div>
+      <div class="sidebar-header">
+        <a class="brand" href="#/home" aria-label="YaMusic — главная">${icon('audio-lines')}<span class="sidebar-label">YaMusic<span class="brand-dot">.</span></span></a>
+        <button class="icon-button sidebar-toggle" type="button" aria-controls="desktop-navigation" aria-label="Свернуть боковое меню" aria-expanded="true">${icon('chevron-left')}</button>
+      </div>
+      <nav id="desktop-navigation" class="desktop-navigation tab-pill-group" aria-label="Основная навигация">${navItems.map(n => `<a href="#/${n.page}" data-page="${n.page}" class="navigation-link" aria-label="${n.label}" title="${n.label}">${icon(n.glyph)}<span class="sidebar-label">${n.label}</span></a>`).join('')}</nav>
+      <div class="settings-account"><a href="#/settings" data-page="settings" aria-label="Настройки" title="Настройки">${icon('settings-2')}<span class="sidebar-label">Настройки</span></a><button data-action="account" data-account-avatar aria-label="Мой аккаунт" title="Мой аккаунт">${accountAvatar()}</button></div>
     </aside>
     <div class="workspace">
       <header class="topbar"><div class="breadcrumbs"><span class="topbar-title">Для вас</span><span class="topbar-divider"></span><span>В вашем ритме</span></div><span class="preview-badge">${icon('disc-3')}<span>Музыка в вашем ритме</span></span></header>
@@ -582,16 +600,24 @@ function renderPlayer(): void {
   if(playlistMenuTrigger&&!playlistMenuTrigger.isConnected)closePlaylistMenu();
   updatePlayerControls(); updateQueueButtons(); hydrateIcons(playerBar); updateProgress();
 }
-function replaceIcon(el: HTMLElement | null, name: string): void { if (el) { el.innerHTML = icon(name); hydrateIcons(el); } }
+function replaceIcon(el: HTMLElement | null, name: string): void {
+  if (!el || el.dataset.glyph === name) return;
+  el.dataset.glyph = name;
+  el.innerHTML = icon(name);
+  hydrateIcons(el);
+}
 function updatePlayerControls(): void {
   const t = player.current;
   const glyph = player.playing ? 'pause' : 'play';
-  document.querySelectorAll('[data-playback-label]').forEach(el=>{
-    el.textContent=player.mode==='full'?'':player.mode==='loading'?'Находим аудио…':'Трек недоступен · попробуйте ещё раз';
+  document.querySelectorAll<HTMLElement>('[data-playback-label]').forEach(el=>{
+    const loading = player.mode === 'loading';
+    const message = loading ? 'Находим аудио…' : player.mode === 'unavailable' ? 'Трек недоступен · попробуйте ещё раз' : '';
+    el.parentElement!.classList.toggle('loading-audio', loading);
+    if (el.textContent !== message) el.textContent = message;
   });
   document.querySelectorAll<HTMLElement>('.transport-play, [data-mobile-play], .full-play').forEach(el => {
     replaceIcon(el, glyph); el.setAttribute('aria-label', player.playing ? 'Пауза' : 'Воспроизвести');
-    el.classList.toggle('is-loading', player.loading); (el as HTMLButtonElement).disabled = !t;
+    (el as HTMLButtonElement).disabled = !t;
   });
   document.querySelectorAll<HTMLButtonElement>('.shuffle-button').forEach(el=>{
     const inWave = Boolean(player.context);
@@ -601,7 +627,7 @@ function updatePlayerControls(): void {
     el.title = inWave ? 'Моя волна сама выбирает порядок треков' : 'Перемешать';
   });
   renderQueue();
-  document.querySelectorAll<HTMLElement>('.repeat-button').forEach(el=> { el.classList.toggle('active',player.repeat !== 'off'); el.setAttribute('aria-label', `Повтор: ${player.repeat === 'one' ? 'одна песня' : player.repeat === 'all' ? 'вся очередь' : 'выключен'}`); replaceIcon(el, player.repeat === 'one' ? 'repeat-1' : 'repeat'); });
+  document.querySelectorAll<HTMLElement>('.repeat-button').forEach(el=> { el.classList.toggle('active',player.repeat !== 'off'); el.setAttribute('aria-pressed', String(player.repeat !== 'off')); el.setAttribute('aria-label', `Повтор: ${player.repeat === 'one' ? 'одна песня' : player.repeat === 'all' ? 'вся очередь' : 'выключен'}`); replaceIcon(el, player.repeat === 'one' ? 'repeat-1' : 'repeat'); });
   document.querySelectorAll<HTMLElement>('.mute-button').forEach(el => {
     const muted = player.volume === 0;
     const label = muted ? 'Включить звук' : 'Выключить звук';
@@ -838,12 +864,14 @@ async function refreshArtistPreferences():Promise<void>{
   }
 }
 let renderedQueue = '';
+let queueTrigger: HTMLElement | undefined;
 
 function closeQueue(restoreFocus = false): void {
   if (!queuePanel.matches(':popover-open')) return;
   queuePanel.hidePopover();
   updateQueueButtons();
-  if (restoreFocus) [...playerBar.querySelectorAll<HTMLButtonElement>('[data-action="queue"]')].find(button=>button.getClientRects().length)?.focus();
+  if (restoreFocus) (queueTrigger?.isConnected ? queueTrigger : playerBar.querySelector<HTMLElement>('[data-action="queue"]'))?.focus();
+  queueTrigger = undefined;
 }
 
 function updateQueueButtons(): void {
@@ -867,14 +895,17 @@ function renderQueue(): void {
   hydrateIcons(queuePanel);
 }
 
-function toggleQueue(): void {
+function toggleQueue(trigger: HTMLElement): void {
   if (queuePanel.matches(':popover-open')) { closeQueue(); return; }
   closePlaylistMenu(); closeSongActions();
   (dialog.open ? dialog : app).append(queuePanel);
+  queueTrigger = trigger;
   queuePanel.showPopover();
   renderQueue();
   updateQueueButtons();
   queuePanel.querySelector<HTMLButtonElement>('[data-action="close-queue"]')?.focus({preventScroll:true});
+  queuePanel.dataset.side = 'above';
+  animateDropdown(queuePanel, [...queuePanel.querySelectorAll<HTMLElement>('.compact-track')]);
 }
 
 function closePlaylistMenu(restoreFocus = false): void {
@@ -1014,7 +1045,7 @@ function collapseFullPlayer(): void {
   }).catch(() => {});
 }
 
-function fullPlayer(lyrics = false): void {
+function fullPlayer(lyrics = true): void {
   const t = player.current;
   if (!t) { toast('Сначала выберите песню'); return; }
   if (fullPlayerClosing) return;
@@ -1026,6 +1057,7 @@ function fullPlayer(lyrics = false): void {
   dialog.className = `full-player-dialog${lyrics ? ' show-lyrics' : ''}`;
   dialog.innerHTML = `
     <div class="expanded-header">
+      ${volumeControl()}
       ${button('collapse-player','chevron-down','Свернуть плеер',alreadyOpen ? '' : 'autofocus')}
     </div>
     <div class="expanded-player">
@@ -1037,7 +1069,6 @@ function fullPlayer(lyrics = false): void {
               <div class="expanded-metadata">
                 <h1><a href="#/album/${t.album_id}" data-action="album" data-id="${t.album_id}"><span class="moving-title-text">${e(t.title)}</span></a></h1>
                 ${artistLinks(t, 'expanded-artist-link')}
-                <span class="preview-note" role="status" data-playback-label></span>
               </div>
             </div>
           </div>
@@ -1064,17 +1095,13 @@ function fullPlayer(lyrics = false): void {
             <button class="icon-button repeat-button" data-action="repeat" aria-label="Повтор">${icon('repeat')}</button>
           </div>
         </div>
-        <div class="expanded-options">
-          <div class="lyrics-tabs">
-            <span class="chip selected desktop-lyrics-tab">Текст песни</span>
-            <button class="chip lyrics-view-toggle${lyrics ? ' selected' : ''}" data-action="lyrics-view" aria-pressed="${lyrics}">Текст песни</button>
-            <button class="chip" data-action="translation" aria-pressed="false" disabled>Перевод</button>
-          </div>
-          ${volumeControl()}
+        <div class="lyrics-tabs">
+          <button class="chip${lyrics ? ' selected' : ''}" data-action="lyrics-view" aria-pressed="${lyrics}" aria-controls="player-lyrics">Текст песни</button>
+          <button class="chip" data-action="translation" aria-pressed="false" disabled ${lyrics ? '' : 'hidden'}>Перевод</button>
         </div>
         <p class="translation-status" role="status" hidden></p>
       </div>
-      <section class="lyrics-panel" aria-label="Текст песни">
+      <section id="player-lyrics" class="lyrics-panel" aria-label="Текст песни" ${lyrics ? '' : 'hidden'}>
         <div class="lyrics-tools">
           <span class="follow-lyrics-control" tabindex="0"><button class="icon-button follow-lyrics" data-action="follow-lyrics" aria-label="Вернуться к текущей строке" aria-pressed="true" disabled>
             ${icon('locate-fixed')}
@@ -1083,7 +1110,8 @@ function fullPlayer(lyrics = false): void {
         <div class="lyrics-scroll" tabindex="0" aria-label="Строки песни">${loading()}</div>
         <div class="lyrics-footer"><span class="lyrics-credit">Тексты · LRCLIB</span><span class="lyrics-credit" data-lyrics-sync hidden>Текст без синхронизации</span></div>
       </section>
-    </div>`;
+    </div>
+    <div class="expanded-audio-status"><span class="audio-spinner" aria-hidden="true"></span><span role="status" data-playback-label></span></div>`;
   dialog.setAttribute('aria-label', 'Полноэкранный плеер');
   if (!alreadyOpen) dialog.showModal();
   mountCoverParallax(dialog.querySelector<HTMLElement>('.expanded-cover-frame')!);
@@ -1195,11 +1223,6 @@ async function toggleTranslation(button: HTMLButtonElement): Promise<void> {
   translationVisible=!translationVisible;
   button.classList.toggle('selected',translationVisible);
   button.setAttribute('aria-pressed',String(translationVisible));
-  if(translationVisible && !dialog.classList.contains('show-lyrics')) {
-    dialog.classList.add('show-lyrics');
-    const mobileTab=dialog.querySelector('.lyrics-view-toggle');
-    mobileTab?.classList.add('selected'); mobileTab?.setAttribute('aria-pressed','true');
-  }
   dialog.querySelectorAll<HTMLElement>('[data-line],[data-plain-line]').forEach(line=>{
     line.querySelector('.lyric-translation')?.remove();
     if(!translationVisible) return;
@@ -1210,21 +1233,43 @@ async function toggleTranslation(button: HTMLButtonElement): Promise<void> {
     translation.className='lyric-translation';
     translation.textContent=translatedLines?.[index]??'';
     line.append(translation);
+    if (interfaceMotion()) translation.animate([{ opacity: 0, translate: '0 5px' }, { opacity: 0.78, translate: '0 0' }], { duration: 260, easing: 'ease-out' });
     if(line.dataset.line!==undefined)line.setAttribute('aria-label',`${original}; ${translation.textContent}, ${formatTime(lyricLines[index].time)}`);
   });
   if(!translationVisible) dialog.querySelectorAll<HTMLElement>('[data-line]').forEach(line=>{
     const original=lyricLines[Number(line.dataset.line)];
     line.setAttribute('aria-label',`${original.text}, ${formatTime(original.time)}`);
   });
-  activeLyric=-1;updateLyrics();
+  activeLyric=-1;updateLyrics(false);
 }
 function setLyricsFollowing(enabled: boolean): void {
   followLyrics = enabled;
+  const scroll = dialog.querySelector<HTMLElement>('.lyrics-scroll');
+  if (!enabled && scroll) stopLyricsScroll(scroll);
   dialog.querySelector('.follow-lyrics')?.setAttribute('aria-pressed', String(enabled));
 }
 
-function updateLyrics(): void {
-  if(!dialog.open || !dialog.classList.contains('full-player-dialog')) return;
+function toggleLyricsView(button: HTMLElement): void {
+  const deck = dialog.querySelector<HTMLElement>('.expanded-deck')!;
+  const panel = dialog.querySelector<HTMLElement>('.lyrics-panel')!;
+  const previous = deck.getBoundingClientRect();
+  deck.getAnimations().forEach(animation => animation.cancel());
+  const shown = dialog.classList.toggle('show-lyrics');
+  button.setAttribute('aria-pressed', String(shown));
+  button.classList.toggle('selected', shown);
+  panel.hidden = !shown;
+  dialog.querySelector<HTMLButtonElement>('[data-action="translation"]')!.hidden = !shown;
+  animateDeck(deck, previous);
+  setLyricsFollowing(shown);
+  if (shown) {
+    activeLyric = -1;
+    updateLyrics(false);
+    if (interfaceMotion()) panel.animate([{ opacity: 0, translate: '0 8px' }, { opacity: 1, translate: '0 0' }], { duration: 300, easing: 'ease-out' });
+  }
+}
+
+function updateLyrics(animate = true): void {
+  if(!dialog.open || !dialog.classList.contains('show-lyrics')) return;
   const synchronized=player.mode==='full' && lyricLines.length>0;
   const follow=dialog.querySelector<HTMLButtonElement>('.follow-lyrics');
   if(follow) follow.disabled=!synchronized;
@@ -1234,13 +1279,17 @@ function updateLyrics(): void {
   if(index===activeLyric) return;
   activeLyric=index;
   dialog.querySelectorAll<HTMLElement>('[data-line]').forEach(line=>{
-    const active=Number(line.dataset.line)===index; line.classList.toggle('active-line',active);
+    const position = Number(line.dataset.line);
+    const active = position === index;
+    line.classList.toggle('active-line', active);
+    line.classList.toggle('past-line', position < index);
+    line.classList.toggle('next-line', position === index + 1);
     if(active) line.setAttribute('aria-current','true'); else line.removeAttribute('aria-current');
   });
   const current=dialog.querySelector<HTMLElement>(`[data-line="${index}"]`), scroll=dialog.querySelector<HTMLElement>('.lyrics-scroll');
+  if (current && animate) animateLyric(current);
   if(current && scroll && scroll.clientHeight>0 && followLyrics) {
-    const delta=current.getBoundingClientRect().top-scroll.getBoundingClientRect().top-scroll.clientHeight/2+current.offsetHeight/2;
-    scroll.scrollTo({top:scroll.scrollTop+delta,behavior:library.settings.animations&&!matchMedia('(prefers-reduced-motion: reduce)').matches?'smooth':'instant'});
+    scrollToLyric(scroll, current);
   }
 }
 let playlistCoverDraft='';
@@ -1494,6 +1543,13 @@ document.addEventListener('click', async event => {
   const target = clicked.closest<HTMLElement>('[data-action]');
   if (!target) { if(clicked.closest('#song-actions a')) queueMicrotask(()=>closeSongActions(true)); return; }
   const action = target.dataset.action, id = target.dataset.id || '';
+  if (target.matches('.transport-buttons button, .hero-controls button, [data-mobile-play], .player-extras button, .expanded-actions button, .mute-button, .lyrics-tabs button')) {
+    const controls = target.closest('.player-bar, .full-player-dialog');
+    queueMicrotask(() => {
+      const button = target.isConnected ? target : controls?.querySelector<HTMLElement>(`button[data-action="${action}"]`);
+      if (button) animatePlayerButton(button);
+    });
+  }
   const fromSongActions=songActions.contains(target), menuAnchor=songActionsTrigger;
   if(fromSongActions)closeSongActions(action !== 'add-playlist-menu');
   const closeForNavigation = () => { if (dialog.open) dialog.close(); };
@@ -1519,8 +1575,9 @@ document.addEventListener('click', async event => {
   else if (action === 'previous') player.previous();
   else if (action === 'shuffle') {
     player.toggleShuffle();api.prepare(player.queue.slice(player.index+1,player.index+6),true);
+    savePlaybackModes();
   }
-  else if (action === 'repeat') player.toggleRepeat();
+  else if (action === 'repeat') { player.toggleRepeat(); savePlaybackModes(); }
   else if (action === 'mute') { if (player.volume > 0) { lastVolume = player.volume; player.setVolume(0); } else player.setVolume(lastVolume); library.settings.volume = player.volume; save(); }
   else if (action === 'like' || action === 'like-current') like(action === 'like' ? tracks.get(id) : player.current);
   else if(action==='dislike'){
@@ -1571,10 +1628,10 @@ document.addEventListener('click', async event => {
     const form = target.closest<HTMLFormElement>('#playlist-form');
     if (form) { form.querySelector<HTMLInputElement>('#playlist-cover-file')!.value = ''; updatePlaylistCoverPreview(form); }
   }
-  else if (action === 'queue') toggleQueue();
+  else if (action === 'queue') toggleQueue(target);
   else if (action === 'close-queue') closeQueue(true);
   else if(action==='blocked-tracks'){try{const data=await api.recommendationStatus();disliked=new Set(data.dislikes);const list=data.blocked_tracks;register(list);showDialog('Не рекомендовать',list.length?`<div class="action-list">${list.map(t=>`<button data-action="dislike" data-id="${e(t.id)}">${icon('plus')}<span>${e(t.title)}<small style="display:block;color:var(--muted)">${e(t.artist)} · Снова рекомендовать</small></span></button>`).join('')}</div>`:empty('В списке пока пусто','Нажмите «Не нравится» в меню песни, чтобы убрать её из рекомендаций.','thumbs-down'));}catch(error){toast(error instanceof Error?error.message:'Не удалось открыть список');}}
-  else if (action === 'expand' || action === 'lyrics') fullPlayer(action === 'lyrics');
+  else if (action === 'expand' || action === 'lyrics') fullPlayer();
   else if (action === 'collapse-player') collapseFullPlayer();
   else if (action === 'close') dialog.close();
   else if (action === 'new-playlist') {
@@ -1604,11 +1661,7 @@ document.addEventListener('click', async event => {
   }
   else if (action === 'import-playlist' || action === 'import-likes') saveImport(action==='import-likes');
   else if (action === 'translation') void toggleTranslation(target as HTMLButtonElement);
-  else if (action === 'lyrics-view') {
-    const shown=dialog.classList.toggle('show-lyrics');
-    target.setAttribute('aria-pressed',String(shown)); target.classList.toggle('selected',shown);
-    setLyricsFollowing(true); activeLyric=-1; updateLyrics();
-  }
+  else if (action === 'lyrics-view') toggleLyricsView(target);
   else if (action === 'seek-lyric') { if(player.mode === 'full') { setLyricsFollowing(true); activeLyric=-1; player.seek(Number(target.dataset.time)); } }
   else if (action === 'follow-lyrics') { setLyricsFollowing(true); activeLyric=-1; updateLyrics(); }
   else if (action === 'retry-lyrics') void loadLyrics();
@@ -1722,7 +1775,7 @@ document.addEventListener('input', event => {
     player.setCrossfade(seconds);
     save();
   }
-  else if (input.matches('[data-volume]')) { player.setVolume(Number(input.value)); library.settings.volume = player.volume; save(); fillRange(input); }
+  else if (input.matches('[data-volume]')) { player.setVolume(Number(input.value)); library.settings.volume = player.volume;save(); fillRange(input); showCurrentVolume(input); }
   else if (input.matches('[data-seek]')) { player.seek(Number(input.value)); fillRange(input); }
   else if (input.id === 'search-input') { clearTimeout(searchTimer); searchTimer = window.setTimeout(()=>void runSearch(),450); }
   else if (input.id === 'playlist-description') resizePlaylistDescription(input as unknown as HTMLTextAreaElement);
@@ -1809,10 +1862,11 @@ dialog.addEventListener('click', event => {
   if (pressedBackdrop && isBackdrop(event)) dialog.close();
   pressedBackdrop = false;
 });
-function adjustVolume(direction:number):void {
+function adjustVolume(direction: number, input?: HTMLInputElement | null): void {
   player.setVolume(Math.round((player.volume+direction*.05)*100)/100);
   library.settings.volume=player.volume;
   save();
+  showCurrentVolume(input);
 }
 let playerSwipe: {id:number;x:number;y:number} | undefined;
 let suppressPlayerClick = 0;
@@ -1834,19 +1888,20 @@ playerBar.addEventListener('click',event=>{
   if(performance.now()<suppressPlayerClick){
     event.preventDefault();event.stopPropagation();return;
   }
-  if(!player.current||(event.target as Element).closest('button,a,input'))return;
+  if(!player.current||(event.target as Element).closest('button,a,input,.player-range'))return;
   fullPlayer();
 });
 document.addEventListener('wheel',event=>{
-  if(event.ctrlKey||!event.deltaY||!(event.target as HTMLElement).closest('.volume-group'))return;
-  event.preventDefault();adjustVolume(event.deltaY<0?1:-1);
+  const input = (event.target as HTMLElement).closest('.volume-group')?.querySelector<HTMLInputElement>('[data-volume]');
+  if(event.ctrlKey||!event.deltaY||!input)return;
+  event.preventDefault();adjustVolume(event.deltaY<0?1:-1,input);
 },{passive:false});
 document.addEventListener('keydown', event => {
   const target=event.target as HTMLElement;
   if (!authUser || event.ctrlKey || event.metaKey || event.altKey || (dialog.open&&!dialog.classList.contains('full-player-dialog'))) return;
   if (target.closest('input,textarea,select,[contenteditable]')) {
-    if (target.matches('[data-volume]') && (event.key==='ArrowUp'||event.key==='ArrowDown')) {
-      event.preventDefault();adjustVolume(event.key==='ArrowUp'?1:-1);
+    if (target instanceof HTMLInputElement && target.matches('[data-volume]') && (event.key==='ArrowUp'||event.key==='ArrowDown')) {
+      event.preventDefault();adjustVolume(event.key==='ArrowUp'?1:-1,target);
     }
     return;
   }
@@ -1854,7 +1909,8 @@ document.addEventListener('keydown', event => {
   if (event.key === 'ArrowRight') { event.preventDefault(); if(!event.repeat)player.next(); }
   if (event.key === 'ArrowLeft') { event.preventDefault(); if(!event.repeat)player.previous(false); }
   if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
-    event.preventDefault();adjustVolume(event.key === 'ArrowUp' ? 1 : -1);
+    const input = (dialog.open ? dialog : playerBar).querySelector<HTMLInputElement>('[data-volume]');
+    event.preventDefault();adjustVolume(event.key === 'ArrowUp' ? 1 : -1,input);
   }
 });
 // Drag the highlight to select a tab on release.
@@ -1962,5 +2018,6 @@ document.addEventListener('error',event=> {
   if (img.closest('.telegram-avatar')) { img.remove(); return; }
   if (app.contains(img)) { img.style.visibility='hidden'; img.parentElement?.classList.add('image-unavailable'); }
 },true);
+mountSidebar(app.querySelector<HTMLElement>('.sidebar')!);
 mountPillGroups();
 renderPlayer(); startSession();

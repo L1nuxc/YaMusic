@@ -1,8 +1,8 @@
 import { interfaceMotion, springState, stepSpring, unit } from './springs.ts';
 
 // Hover motion from DesignBookmark's Parallax Ticket.
-const tilt = 14;
-const depth = 12;
+const tilt = 5;
+const depth = 7;
 const stiffness = 220;
 const damping = 18;
 
