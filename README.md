@@ -4,6 +4,8 @@
 
 ## Windows x64
 
+[Скачать Windows-версию](https://github.com/L1nuxc/YaMusic/releases/latest)
+
 - `YaMusic-0.1.0-windows-x64-setup.exe` устанавливает приложение для текущего пользователя и при необходимости загружает WebView2.
 - `YaMusic-0.1.0-windows-x64.exe` запускается без установки при наличии WebView2.
 
