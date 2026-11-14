@@ -2,16 +2,36 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "YaMusic",
   "mainBinaryName": "YaMusic",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "xyz.pigboss.yamusic",
   "build": {
-    "frontendDist": "https://yamusic.pigboss.xyz/"
+    "frontendDist": "../client/dist",
+    "beforeBuildCommand": "npm run build"
   },
   "app": {
     "windows": [],
     "withGlobalTauri": false,
     "security": {
-      "capabilities": []
+      "assetProtocol": { "enable": true, "scope": [] },
+      "capabilities": [
+        {
+          "identifier": "online-desktop",
+          "windows": ["main"],
+          "local": false,
+          "remote": { "urls": ["https://yamusic.pigboss.xyz/*"] },
+          "permissions": [
+            "allow-desktop-ready", "allow-open-offline", "allow-install-update", "allow-offline-set-account",
+            "allow-offline-list", "allow-offline-folder", "allow-offline-choose-folder",
+            "allow-offline-begin", "allow-offline-write", "allow-offline-finish",
+            "allow-offline-cancel", "allow-offline-remove", "allow-offline-playlists", "allow-offline-save-playlist"
+          ]
+        },
+        {
+          "identifier": "local-desktop",
+          "windows": ["main"],
+          "permissions": ["allow-offline-account", "allow-offline-list", "allow-offline-folder", "allow-offline-remove", "allow-offline-playlists"]
+        }
+      ]
     }
   },
   "bundle": {
@@ -24,12 +44,18 @@
     ],
     "windows": {
       "nsis": {
-        "installMode": "currentUser"
+        "installMode": "currentUser",
+        "languages": ["Russian"],
+        "displayLanguageSelector": false,
+        "template": "windows/installer.nsi",
+        "headerImage": "windows/header.bmp",
+        "sidebarImage": "windows/sidebar.bmp"
       },
       "webviewInstallMode": {
         "type": "downloadBootstrapper",
         "silent": true
       }
     }
-  }
+  },
+  "plugins": { "updater": { "pubkey": "", "windows": { "installMode": "passive" } } }
 }

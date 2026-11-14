@@ -13,6 +13,17 @@ export interface VisualAudio {
 
 const silence: VisualAudio = { bass: 0, mids: 0, highs: 0, pulse: 0, pace: 0 };
 
+export interface LivePlayback {
+  track: Track;
+  queue: Track[];
+  context?: string;
+  position: number;
+  playing: boolean;
+  volume: number;
+  shuffle: boolean;
+  repeat: 'off' | 'all' | 'one';
+}
+
 export class Player extends EventTarget {
   audio = new Audio();
   private spare?: HTMLAudioElement;
@@ -23,7 +34,11 @@ export class Player extends EventTarget {
   private prepared?: { audio: HTMLAudioElement; trackId: string; starting: boolean; failed: boolean };
   private fade?: { start: number; duration: number };
   private fadeFrame = 0;
-  get volume(): number { return this.masterVolume; }
+  get volume(): number { return this.remote?.volume ?? this.masterVolume; }
+  get mirroring(): boolean { return this.remote !== undefined; }
+  private remote?: LivePlayback & { sampledAt: number };
+  remoteControl?: (action: string, value?: number) => void;
+  offlineSource?: (trackId: string) => string | undefined;
   queue: Track[] = [];
   index = -1;
   playing = false;
@@ -50,8 +65,14 @@ export class Player extends EventTarget {
   private connectingAudio = false;
   private errorSequence = -1;
   get current(): Track | undefined { return this.queue[this.index]; }
-  get duration(): number { return Number.isFinite(this.audio.duration) ? this.audio.duration : this.current?.duration_sec || 0; }
-  get time(): number { return this.restoredPosition ?? (this.retryTime || this.audio.currentTime || 0); }
+  get duration(): number { return !this.remote && Number.isFinite(this.audio.duration) ? this.audio.duration : this.current?.duration_sec || 0; }
+  get time(): number {
+    if(this.remote){
+      const elapsed=this.remote.playing?(performance.now()-this.remote.sampledAt)/1000:0;
+      return Math.min(this.duration,this.remote.position+elapsed);
+    }
+    return this.restoredPosition ?? (this.retryTime || this.audio.currentTime || 0);
+  }
 
   constructor(volume: number) {
     super();
@@ -82,7 +103,7 @@ export class Player extends EventTarget {
       this.change(); this.mediaState(); this.dispatchEvent(new Event('playing'));
     });
     on('pause', () => {
-      if (audio.ended) return;
+      if (audio.ended || this.remote) return;
       this.cancelCrossfade();
       this.playing = false; this.change(); this.mediaState(); this.dispatchEvent(new Event('pause'));
     });
@@ -111,7 +132,7 @@ export class Player extends EventTarget {
         const resume = !this.audio.paused || this.loading || this.playing;
         this.retryTime = this.time;
         this.loading = resume; this.playing = false;
-        this.audio.src = `/api/stream/${encodeURIComponent(this.current.id)}?refresh=1`;
+        this.audio.src = this.offlineSource?.(this.current.id) ?? `/api/stream/${encodeURIComponent(this.current.id)}?refresh=1`;
         this.change();
         if (resume) this.resume();
         return;
@@ -130,6 +151,7 @@ export class Player extends EventTarget {
     });
   }
   play(track: Track, tracks: Track[] = [track], context?:string): void {
+    if(this.remote){this.remoteControl?.('local_play');return;}
     this.finish(false);this.context=context;
     const candidates = tracks.some(t => t.id === track.id) ? tracks : [track, ...tracks];
     const queue = candidates;
@@ -154,6 +176,7 @@ export class Player extends EventTarget {
     this.load(false,position);
   }
   reset(): void {
+    this.remote=undefined;
     this.cancelCrossfade();
     this.sequence++;
     this.queue=[];this.originalOrder=[];this.index=-1;this.context=undefined;
@@ -191,10 +214,11 @@ export class Player extends EventTarget {
     this.dispatchEvent(new CustomEvent('trackchange', { detail: track })); this.change();
   }
   resume(): void {
+    if(this.remote){if(!this.remote.playing)this.remoteControl?.('toggle');return;}
     if(this.restoredPosition!==undefined && this.current){
       this.retryTime=this.restoredPosition;this.restoredPosition=undefined;
       this.loading=true;this.mode='loading';
-      this.audio.src=`/api/stream/${encodeURIComponent(this.current.id)}`;
+      this.audio.src=this.streamUrl(this.current.id);
       this.change();
     }
     if (this.mode === 'unavailable') { this.load(); return; }
@@ -214,7 +238,7 @@ export class Player extends EventTarget {
   }
   /** Audio is only rerouted after the browser has allowed the context to run. */
   private connectVisualAudio(): void {
-    if (this.connectingAudio || typeof AudioContext === 'undefined') return;
+    if (this.offlineSource?.(this.current?.id??'') || this.connectingAudio || typeof AudioContext === 'undefined') return;
     this.connectingAudio = true;
     try {
       const context = this.audioContext ??= new AudioContext();
@@ -270,7 +294,7 @@ export class Player extends EventTarget {
     gain.connect(this.mixer);
     this.audioGains.set(audio,gain);
   }
-  private streamUrl(id: string): string { return `/api/stream/${encodeURIComponent(id)}`; }
+  private streamUrl(id: string): string { return this.offlineSource?.(id) ?? `/api/stream/${encodeURIComponent(id)}`; }
   private applyVolumes(progress = 0): void {
     const set = (audio: HTMLAudioElement, level: number) => {
       const gain=this.audioGains.get(audio);
@@ -365,9 +389,47 @@ export class Player extends EventTarget {
     this.tick();
     return true;
   }
-  pause(): void { this.cancelCrossfade(); this.audio.pause(); }
-  toggle(): void { if (this.current) { if (this.audio.paused) this.resume(); else this.pause(); } }
+  mirror(playback: LivePlayback): void {
+    const trackChanged=this.current?.id!==playback.track.id;
+    const controlsChanged=!this.remote || this.playing!==playback.playing || this.volume!==playback.volume ||
+      this.context!==playback.context || this.shuffle!==playback.shuffle || this.repeat!==playback.repeat ||
+      this.queue.length!==playback.queue.length || this.queue.some((item,index)=>item.id!==playback.queue[index]?.id);
+    const entering=!this.remote;
+    this.remote={...playback,sampledAt:performance.now()};
+    if(entering) {
+      this.sequence++;
+      this.cancelCrossfade();
+      this.audio.pause();this.audio.removeAttribute('src');this.audio.load();
+      this.restoredPosition=undefined;this.retryTime=0;
+    }
+    this.queue=playback.queue.some(track=>track.id===playback.track.id)?playback.queue:[playback.track,...playback.queue];
+    this.index=this.queue.findIndex(track=>track.id===playback.track.id);
+    this.context=playback.context??undefined;
+    this.shuffle=playback.shuffle;this.repeat=playback.repeat;
+    this.mode='full';this.playing=playback.playing;this.loading=false;
+    if(trackChanged)this.announceTrack(playback.track);
+    else if(controlsChanged)this.change();
+    this.mediaState();
+    this.dispatchEvent(new Event('tick'));
+  }
+  stopMirroring(): void {
+    if(!this.remote)return;
+    const position=this.time;
+    this.remote=undefined;
+    this.restoredPosition=position;
+    this.playing=false;this.loading=false;
+    this.change();this.mediaState();
+  }
+  pause(): void {
+    if(this.remote){if(this.remote.playing)this.remoteControl?.('toggle');return;}
+    this.cancelCrossfade(); this.audio.pause();
+  }
+  toggle(): void {
+    if(this.remote){this.remoteControl?.('toggle');return;}
+    if (this.current) { if (this.audio.paused) this.resume(); else this.pause(); }
+  }
   next(ended = false, feedback = true): void {
+    if(this.remote){if(!ended)this.remoteControl?.('next');return;}
     this.cancelCrossfade();
     this.finish(ended||!feedback);
     const index = nextIndex(this.index, this.queue.length, this.context ? 'off' : this.repeat, false, ended);
@@ -379,6 +441,7 @@ export class Player extends EventTarget {
     this.index = index; this.load();
   }
   playQueued(index: number): void {
+    if(this.remote){this.remoteControl?.('queued',index);return;}
     if (!Number.isInteger(index) || index < this.index || !this.queue[index]) return;
     if (index === this.index) { this.toggle(); return; }
     this.finish(false);
@@ -386,10 +449,12 @@ export class Player extends EventTarget {
     this.load();
   }
   previous(restartCurrent = true): void {
+    if(this.remote){this.remoteControl?.('previous',restartCurrent?1:0);return;}
     if (restartCurrent && this.time > 3) { this.seek(0); return; }
     if (this.index > 0) { this.finish(false);this.index--; this.load(); } else this.seek(0);
   }
   seek(time: number): void {
+    if(this.remote){this.remoteControl?.('seek',time);return;}
     if(!this.current)return;
     if(this.restoredPosition!==undefined){
       this.restoredPosition=Math.max(0,Math.min(this.duration,time));
@@ -399,12 +464,17 @@ export class Player extends EventTarget {
     this.audio.currentTime = Math.max(0, Math.min(this.duration, time)); this.tick();
   }
   setVolume(value: number): void {
+    if(this.remote){this.remoteControl?.('volume',value);return;}
     this.masterVolume=Math.max(0,Math.min(1,value));
     if(this.fade)this.updateCrossfade();else this.applyVolumes();
     this.change();
   }
-  toggleRepeat(): void { this.repeat = this.repeat === 'off' ? 'all' : this.repeat === 'all' ? 'one' : 'off'; this.updateCrossfade(); this.change(); }
+  toggleRepeat(): void {
+    if(this.remote){this.remoteControl?.('repeat');return;}
+    this.repeat = this.repeat === 'off' ? 'all' : this.repeat === 'all' ? 'one' : 'off'; this.updateCrossfade(); this.change();
+  }
   toggleShuffle(): void {
+    if(this.remote){this.remoteControl?.('shuffle');return;}
     if (this.context) return;
     this.shuffle = !this.shuffle;
     if (this.shuffle) this.shuffleAhead();

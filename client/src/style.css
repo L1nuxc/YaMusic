@@ -161,15 +161,6 @@ main::-webkit-scrollbar-thumb { background: rgba(128,128,128,.22); border-radius
 .card-play { position: absolute; bottom: 12px; right: 12px; width: 39px; height: 39px; display: grid; place-items: center; border-radius: 50%; background: #eeeeeef0; color: #191a1d; box-shadow: 0 5px 24px #00000022; opacity: 0; transform: translateY(7px); transition: opacity .25s,transform .25s; }
 .card-play .icon { width: 17px; height: 17px; fill: currentColor; }
 .music-card:hover .card-play, .music-card:focus-visible .card-play { opacity: 1; transform: translateY(0); }
-.neuro-banner { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 19px 23px; display: flex; gap: 25px; align-items: center; justify-content: space-between; margin: 32px 0 39px; }
-.neuro-heading { display: flex; gap: 14px; align-items: center; }
-.neuro-heading h2 { font-size: 17px; }
-.neuro-heading p { font-size: 10px; margin-top: 4px; }
-.neuro-icon > .icon { width: 28px; height: 28px; }
-.neuro-banner form { flex: 1; max-width: 420px; min-width: 150px; display: flex; align-items: center; border: 1px solid var(--line); background: rgba(128,128,128,.06); border-radius: var(--radius); padding: 2px 3px 2px 16px; }
-.neuro-banner input { min-width: 0; width: 100%; background: none; border: 0; font-size: 12px; color: var(--text); padding: 8px 0; outline: none; }
-.neuro-banner input::placeholder { color: var(--muted); }
-.neuro-banner form:focus-within { box-shadow: 0 0 0 1px var(--soft); }
 .mood-art { background: radial-gradient(ellipse at 68% 28%,#7d7797 0,transparent 24%),linear-gradient(155deg,#334756,#202532 65%,#706580); color: #eef1f4; }
 .mood-art.evening { background: radial-gradient(circle at 32% 35%,#d5bca4 0,transparent 30%),linear-gradient(150deg,#97808b,#373748 65%,#55404b); }
 .mood-art.focus { background: radial-gradient(ellipse at 70% 20%,#9ab7a5 0,transparent 40%),linear-gradient(140deg,#728986,#293b3d 65%,#344a50); }
@@ -573,8 +564,6 @@ dialog::backdrop { background: rgba(5,6,7,.7); }
   .player-extras > :not([data-action="queue"]) { display: none; }
   .player-end { gap: 12px; }
   .player-information { gap: 10px; }
-  .neuro-banner { padding: 18px; gap: 20px; }
-  .neuro-heading p { display: none; }
   .track-number { display: none; }
   .card-grid { grid-template-columns: repeat(4,minmax(0,1fr)); }
 }
@@ -591,13 +580,9 @@ dialog::backdrop { background: rgba(5,6,7,.7); }
   .card-rail { grid-auto-columns: 145px; overflow-x: auto; padding-bottom: 5px; }
   .card-grid { grid-template-columns: repeat(3,minmax(0,1fr)); }
   .player-bar { grid-template-columns: minmax(150px,1fr) minmax(230px,1.6fr) 171px; }
+  .player-end > .device-status { display: none; }
   .time-label { display: none; }
   .track-album { display: none; }
-  .neuro-banner { gap: 12px; }
-  .neuro-icon .icon { width: 23px; }
-  .neuro-heading { gap: 10px; }
-  .neuro-heading h2 { font-size: 15px; }
-  .neuro-banner input { font-size: 11px; }
   .breadcrumbs > span:last-child,.topbar-divider { display: none; }
   .setting-label { gap: 10px; font-size: 12px; }
   .segmented button { min-width: 72px; padding: 8px 11px; }
@@ -647,15 +632,6 @@ dialog::backdrop { background: rgba(5,6,7,.7); }
   .music-card > strong { font-size: 11px; margin-top: 10px; }
   .music-card > span:last-child:not(.card-image) { font-size: 9px; }
   .card-play { display: none; }
-  .neuro-banner { flex-direction: column; align-items: stretch; padding: 16px; gap: 14px; margin: 22px 0 29px; }
-  .neuro-heading { gap: 10px; }
-  .neuro-heading h2 { font-size: 17px; }
-  .neuro-heading p { display: none; }
-  .neuro-icon .icon { width: 21px; height: 21px; }
-  .neuro-banner form { min-width: 0; max-width: none; padding-left: 12px; }
-  .neuro-banner input { font-size: 11px; }
-  .neuro-banner .icon-button { width: 31px; height: 31px; }
-  .neuro-banner .icon-button .icon { width: 17px; height: 17px; }
   .mood-symbol .icon { width: 40px; height: 40px; }
   .filter-row { flex-wrap: nowrap; overflow: auto; gap: 7px; margin: 18px -21px 24px 0; padding-right: 21px; scrollbar-width: none; }
   .filter-row::-webkit-scrollbar { display: none; }
@@ -761,6 +737,7 @@ dialog::backdrop { background: rgba(5,6,7,.7); }
 
   .full-player-dialog { max-height: none; border-radius: 0; padding: calc(10px + env(safe-area-inset-top)) 18px calc(12px + env(safe-area-inset-bottom)); }
   .expanded-header { gap: 7px; }
+  .expanded-header .device-status { min-width: 0; }
   .expanded-player { grid-template-columns: minmax(0,1fr); gap: 12px; }
   .expanded-deck { max-width: 360px; }
   .expanded-cover-frame { width: min(100%,max(100px,calc(100dvh - 266px)),360px); }

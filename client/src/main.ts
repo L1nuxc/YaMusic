@@ -2,7 +2,7 @@ import './style.css';
 import './features.css';
 import { icon, hydrateIcons } from './icons.ts';
 import { api } from './api.ts';
-import type { WaveQueue, DailyMix, Reaction, AuthUser, AuthConfig, TelegramLogin, ResumeSnapshot, ImportPreview } from './api.ts';
+import type { WaveQueue, Mixes, Reaction, AuthUser, AuthConfig, TelegramLogin, ResumeSnapshot, ImportPreview } from './api.ts';
 import { escapeHtml as e, formatTime, restoreLibrary, safeImage, STORAGE_KEY, isTrack, uniqueTracks, trackArtists, restoreSearchHistory, rememberSearch } from './model.ts';
 import { Player } from './player.ts';
 import { Wave } from './wave.ts';
@@ -20,10 +20,17 @@ import { mountCoverParallax } from './cover-parallax.ts';
 import { mountSidebar } from './sidebar.ts';
 import { animateDeck, animateLyricEcho, animatePlayerButton, scrollToLyric, stopLyricsScroll } from './player-motion.ts';
 import { interfaceMotion } from './springs.ts';
+import { applyAccountLibrary, LibrarySync } from './account-library.ts';
+import { PlaybackDevices } from './playback-devices.ts';
+import { desktopUpdate, Downloads, invokeDesktop, localDesktop, windowsDesktop } from './desktop.ts';
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
 const dialog = document.querySelector<HTMLDialogElement>('#dialog')!;
 let library = restoreLibrary(localStorage.getItem(STORAGE_KEY));
+let librarySync: LibrarySync | undefined;
+let libraryUser: number | undefined;
+let playbackDevices: PlaybackDevices | undefined;
+let downloads: Downloads | undefined;
 const player = new Player(library.settings.volume);
 player.setCrossfade(library.settings.crossfade);
 const playbackModesKey = 'yamusic.playback-modes.v1';
@@ -34,6 +41,7 @@ try {
 } catch { /* Keep the playback defaults if storage is unavailable. */ }
 
 function savePlaybackModes(): void {
+  if (player.mirroring) return;
   try {
     localStorage.setItem(playbackModesKey, JSON.stringify({ shuffle: player.shuffle, repeat: player.repeat }));
   } catch { /* Playback can continue without storage. */ }
@@ -65,8 +73,8 @@ let activeLyric = -1;
 let followLyrics = true;
 let waveQueue:WaveQueue|undefined;
 let wavePromise:Promise<WaveQueue>|undefined;
-let dailyMix:DailyMix|undefined;
-let dailyPromise:Promise<DailyMix>|undefined;
+let personalMixes:Mixes|undefined;
+let mixesPromise:Promise<Mixes>|undefined;
 let disliked=new Set<string>();
 let profileReady:Promise<void>|undefined;
 let recommendationUpdate:Promise<void>=Promise.resolve();
@@ -84,8 +92,6 @@ let restoringPlayback = false;
 let lastCloudSave = 0;
 let lastCloudPosition = '';
 let lastCapture = 0;
-let neuroRequest: AbortController | undefined;
-let neuroTracks: Track[] = [];
 const useMobilePlayer = matchMedia('(max-width: 760px)');
 async function refreshAuth():Promise<void>{
   const [config,profile]=await Promise.all([api.authConfig(),api.authMe()]);
@@ -98,7 +104,6 @@ window.setInterval(()=>{
     if(status.analyzed_tracks===lastAnalyzedCount)return;lastAnalyzedCount=status.analyzed_tracks;
     if(status.likes.length){
       if(waveQueue?.learning&&!player.context){waveQueue=undefined;void getWave().then(drawWaveQueue).catch(()=>{});}
-      if(dailyMix&&(!dailyMix.personalized||dailyMix.tracks.length<50)){dailyMix=undefined;void getDaily().then(drawDaily).catch(()=>{});}
     }
   }).catch(()=>{});
 },20000);
@@ -116,19 +121,30 @@ async function getWave():Promise<WaveQueue>{
   const epoch=authEpoch;
   return wavePromise??=(async()=>{await syncProfile();await getDiscovery();const data=await api.wave();if(epoch!==authEpoch)throw new Error('Профиль изменился. Обновите подборку.');register(data.tracks);waveQueue=data;return data;})().finally(()=>{if(epoch===authEpoch)wavePromise=undefined;});
 }
-async function getDaily():Promise<DailyMix>{
-  if(dailyMix?.day===new Date().toISOString().slice(0,10)&&dailyMix.tracks.length===50)return dailyMix;
+async function getMixes(): Promise<Mixes> {
   const epoch=authEpoch;
-  return dailyPromise??=(async()=>{await syncProfile();await getDiscovery();const data=await api.dailyMix();if(epoch!==authEpoch)throw new Error('Профиль изменился. Обновите подборку.');data.tracks=data.tracks.filter(t=>!disliked.has(t.id));register(data.tracks);api.prepare(data.tracks.slice(0,3));dailyMix=data;return data;})().finally(()=>{if(epoch===authEpoch)dailyPromise=undefined;});
+  return mixesPromise??=(async()=>{
+    await syncProfile();
+    const data=await api.mixes();
+    if(epoch!==authEpoch)throw new Error('Профиль изменился. Обновите подборки.');
+    for(const mix of data.mixes)mix.tracks=register(mix.tracks.filter(track=>!disliked.has(track.id)));
+    personalMixes=data;
+    return data;
+  })().finally(()=>{if(epoch===authEpoch)mixesPromise=undefined;});
 }
 function drawWaveQueue():void{
   const note=document.querySelector('.hero-footnote');
   if(note&&waveQueue)note.textContent=waveQueue.personalized?'Подстраивается под ваш вкус':'Знакомимся с вашим вкусом · ставьте лайки';
 }
-function drawDaily():void{
-  const target=document.querySelector('#daily-cards');if(!target||!dailyMix)return;
-  target.innerHTML=dailyMix.tracks.slice(0,5).map(t=>`<article class="music-card"><button class="card-image" data-action="play-daily-track" data-id="${e(t.id)}" aria-label="Включить ${e(t.title)}">${image(t.cover_url)}<span class="card-play">${icon('play')}</span></button><a class="card-title" href="#/album/${t.album_id}" data-action="album" data-id="${t.album_id}">${e(t.title)}</a>${artistLinks(t, "card-artist")}</article>`).join('');
-  const detail=document.querySelector('.daily-section .section-heading p');if(detail)detail.textContent=`${trackCount(dailyMix.tracks.length)} · ${dailyMix.personalized?'подобраны для вас':'знакомство с вашим вкусом'}`;hydrateIcons(target as HTMLElement);
+function drawMixes(): void {
+  const target=document.querySelector<HTMLElement>('#daily-cards');
+  if(!target||!personalMixes)return;
+  target.innerHTML=personalMixes.mixes.map((mix,index)=>`
+    <a href="#/daily/${e(mix.id)}" class="music-card">
+      <span class="card-image mood-art ${['evening','night','focus','ambient','evening'][index]}">${mix.tracks[0]?.cover_url?image(mix.tracks[0].cover_url):icon('list-music')}</span>
+      <strong class="card-title">${e(mix.title)}</strong><span>${e(mix.description)}</span>
+    </a>`).join('');
+  hydrateIcons(target);
 }
 
 function register(list: Track[]): Track[] { list.forEach(t => tracks.set(t.id, t)); return list; }
@@ -154,7 +170,11 @@ function trackCount(n: number): string {
 }
 register([...library.likes, ...library.history, ...library.playlists.flatMap(p => p.tracks)]);
 function save(): boolean {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(library)); return true; }
+  try {
+    localStorage.setItem(libraryUser===undefined ? STORAGE_KEY : `${STORAGE_KEY}.${libraryUser}`, JSON.stringify(library));
+    librarySync?.capture(library,searchHistory);
+    return true;
+  }
   catch { toast('Не хватает места для медиатеки. Попробуйте уменьшить обложку или сохранить копию коллекции.'); return false; }
 }
 function applySettings(): void {
@@ -162,6 +182,86 @@ function applySettings(): void {
   document.documentElement.dataset.motion = library.settings.animations ? 'on' : 'off';
   document.querySelector('meta[name="theme-color"]')?.setAttribute('content', library.settings.theme === 'dark' ? '#151617' : '#f3f3f1');
   wave?.setEnabled(library.settings.animations);
+}
+
+async function openDownloads(account: number): Promise<void> {
+  const downloadList=new Downloads(account);
+  downloads=downloadList;
+  if(localDesktop)player.offlineSource=id=>downloads?.source(id);
+  await downloadList.refresh();
+  if(downloads===downloadList&&currentView==='downloads')downloadsView();
+}
+
+function downloadsView(): void {
+  const id=location.hash.split('/')[2]??'';
+  const playlist=downloads?.playlists[id];
+  const entries=downloads?.entries??{};
+  const members=playlist?playlist.tracks.flatMap(id=>entries[id]?[entries[id]]:[]):Object.values(entries);
+  const list=members.map(({track,artwork})=>({
+    ...track,cover_url:artwork||track.cover_url,
+  }));
+  visibleTracks=register(list);
+  main.innerHTML=`<div class="page-heading"><h1>${e(playlist?.title??'Скачанное')}</h1><div class="heading-actions">${localDesktop?
+    '<a class="secondary-button" href="https://yamusic.pigboss.xyz/">Вернуться онлайн</a>':
+    '<button class="secondary-button" data-action="downloads-folder">Выбрать папку</button>'}</div></div>
+    ${playlist?'<a class="text-button" href="#/downloads">Все загрузки</a>':`
+      ${downloads?.folder?`<p class="download-folder">${e(downloads.folder)}</p>`:''}
+      <div class="filter-row">${Object.entries(downloads?.playlists??{}).filter(([,item])=>item.tracks.some(id=>id in entries))
+        .map(([id,item])=>`<a class="chip" href="#/downloads/${encodeURIComponent(id)}">${e(item.title)}</a>`).join('')}</div>`}
+    ${list.length?`<button class="primary-button" data-action="play-list">${icon('play')}Слушать</button><div class="track-list">${list.map((track,index)=>`<div class="download-row">${row(track,index)}${button('remove-download','trash-2','Удалить скачанный трек',`data-id="${e(track.id)}"`)}</div>`).join('')}</div>`:empty('Загрузок пока нет','Скачайте трек или плейлист в YaMusic, чтобы слушать его офлайн.','download')}`;
+  hydrateIcons(main);
+}
+
+async function queueDownloads(list: Track[], trigger: HTMLElement, playlist?:{id:string;title:string}): Promise<void> {
+  const target=downloads;
+  if(!target||!list.length)return;
+  trigger.setAttribute('disabled','');
+  let failed=0;
+  try {
+    for(const track of uniqueTracks(list)){
+      if(downloads!==target)break;
+      try{await target.save(track);}catch{failed++;}
+    }
+    if(playlist&&downloads===target)await target.savePlaylist(playlist.id,playlist.title,list);
+    toast(failed?`Не удалось скачать ${trackCount(failed)}`:'Загрузка готова');
+    if(currentView==='downloads')downloadsView();
+  } catch(error) { toast(String(error)); }
+  finally { trigger.removeAttribute('disabled'); }
+}
+
+function showUpdateNotification(): void {
+  const version=desktopUpdate();
+  if(!version||localDesktop)return;
+  const old=document.querySelector('.desktop-update');
+  if(old)return;
+  const message=document.createElement('aside');
+  message.className='desktop-update';
+  message.setAttribute('role','status');
+  message.innerHTML=`<span>Версия ${e(version)} скачана</span><button class="primary-button" data-action="install-update">Установить</button>${button('dismiss-update','x','Закрыть')}`;
+  document.body.append(message);hydrateIcons(message);
+  const actions=document.querySelector<HTMLElement>('[data-update-actions]');
+  if(actions){actions.innerHTML=updateAction();hydrateIcons(actions);}
+}
+
+function updateAction(): string {
+  const version=desktopUpdate();
+  return version?`<button class="secondary-button" data-action="install-update">Установить ${e(version)}</button>`:'';
+}
+
+function downloadListButton(): string {
+  return windowsDesktop&&!localDesktop&&visibleTracks.length?
+    '<button class="secondary-button" data-action="download-list">'+icon('download')+'Скачать</button>':'';
+}
+
+function desktopSettings(): string {
+  if(!windowsDesktop||localDesktop)return '';
+  return `<section class="settings-group">
+    <h2>Приложение Windows</h2>
+    <div class="setting-row"><span class="setting-label">${icon('download')}<span>Папка загрузок<small>${e(downloads?.folder??'')}</small></span></span>
+      <button class="secondary-button" data-action="downloads-folder">Выбрать</button></div>
+    <div class="setting-row"><a href="#/downloads">Скачанное</a><button class="secondary-button" data-action="open-offline">Открыть офлайн</button></div>
+    <div class="setting-row"><span class="setting-label">${icon('refresh-cw')}<span>Обновления<small>Проверяются при запуске</small></span></span><span data-update-actions>${updateAction()}</span></div>
+  </section>`;
 }
 applySettings();
 function toast(message: string): void {
@@ -312,9 +412,7 @@ async function getDiscovery(): Promise<Track[]> {
 function home(): void {
   hydrateSavedCredits(library.history.slice(0,4));
   main.innerHTML = `<div class="home-content"><section class="home-hero" aria-label="Моя волна"><canvas class="wave-canvas" aria-hidden="true"></canvas><div class="hero-main"><h1>Моя волна</h1><div class="hero-controls">${button('previous', 'skip-back', 'Предыдущий трек')}<button class="wave-play" data-action="wave" aria-label="Включить Мою волну">${icon(player.context&&player.playing ? 'pause' : 'play')}</button>${button('next', 'skip-forward', 'Следующий трек')}</div><span class="hero-footnote">Знакомимся с вашим вкусом</span></div></section>
-    <section class="neuro-banner"><div class="neuro-heading"><span class="neuro-icon">${icon('sparkles')}</span><div><h2>Нейро-волна</h2></div></div><form id="neuro-form"><input name="mood" aria-label="Настроение для Нейро-волны" placeholder="Настроение, жанр или исполнитель…" maxlength="300"/><button class="icon-button" aria-label="Создать Нейро-волну">${icon('arrow-right')}</button></form></section>
-    <section id="neuro-results" class="section" hidden></section>
-    <section class="section daily-section">${sectionHeading('Микс дня', '<a class="text-button" href="#/daily">Все треки '+icon('arrow-right')+'</a>', 'Найти что-то близкое. Услышать что-то новое.')}<div class="card-rail" id="daily-cards">${loading()}</div></section>
+    <section class="section daily-section">${sectionHeading('Подборки для вас')}<div class="card-rail" id="daily-cards">${loading()}</div></section>
     <section class="section">${sectionHeading('Откройте новое', '<a class="text-button" href="#/search">Весь каталог '+icon('arrow-right')+'</a>')}<div id="discovery-tracks">${loading()}</div></section>
     <section class="section" id="recent-section">${library.history.length ? sectionHeading('Недавно слушали', '<a class="text-button" href="#/history">Вся история '+icon('arrow-right')+'</a>') + rows(library.history, 4) : ''}</section>
     <p class="page-footnote">YaMusic · музыка в вашем ритме</p></div>`;
@@ -333,7 +431,7 @@ function home(): void {
     hydrateIcons(main);
   });
   void getWave().then(()=>{if(gen===generation)drawWaveQueue();}).catch(()=>{});
-  void getDaily().then(()=>{if(gen===generation)drawDaily();}).catch(()=>{if(gen===generation)document.querySelector('#daily-cards')!.innerHTML='<p class="muted">Микс пока недоступен</p>';});
+  void getMixes().then(()=>{if(gen===generation)drawMixes();}).catch(()=>{if(gen===generation)document.querySelector('#daily-cards')!.innerHTML='<p class="muted">Микс пока недоступен</p>';});
 }
 
 function search(): void {
@@ -344,7 +442,7 @@ function search(): void {
   hydrateIcons(main);
   syncTabPill(main.querySelector<HTMLElement>(".tab-pill-group")!);
 }
-function saveSearchHistory():void {try{localStorage.setItem(SEARCH_HISTORY_KEY,JSON.stringify(searchHistory));}catch{/* Browsing remains available with full storage. */}}
+function saveSearchHistory():void {try{localStorage.setItem(libraryUser===undefined?SEARCH_HISTORY_KEY:`${SEARCH_HISTORY_KEY}.${libraryUser}`,JSON.stringify(searchHistory));librarySync?.capture(library,searchHistory);}catch{/* Browsing remains available with full storage. */}}
 function rememberCurrentSearch():void {if(!searchQuery.trim())return;searchHistory=rememberSearch(searchHistory,searchQuery);saveSearchHistory();}
 function drawSearchStart(): void {
   loadMoodCovers();
@@ -420,7 +518,7 @@ let libraryFilter = 'all';
 function libraryView(): void {
   hydrateSavedCredits([...library.likes,...library.history.slice(0,5),...library.playlists.flatMap(p=>p.tracks.slice(0,1))]);
   visibleTracks = library.likes;
-  if (!main.querySelector("#library-results")) main.innerHTML = `<div class="page-heading"><div><span class="eyebrow">ТО, ЧТО БЛИЗКО</span><h1>Медиатека</h1></div><div class="heading-actions"><a class="secondary-button library-settings" href="#/settings" aria-label="Настройки" title="Настройки">${icon('settings-2')}</a><button class="secondary-button" data-action="import" aria-label="Импорт коллекции">${icon('import')}<span>Импорт</span></button><button class="secondary-button" data-action="new-playlist" aria-label="Создать плейлист">${icon('plus')}<span>Плейлист</span></button></div></div><div class="filter-row"><div class="tab-pill-group" role="group" aria-label="Раздел медиатеки">${[['all','Всё'],['playlists','Плейлисты'],['likes','Мне нравится'],['artists','Исполнители']].map(([id,label])=>`<button class="chip ${libraryFilter === id ? 'selected' : ''}" data-action="library-filter" data-filter="${id}" aria-pressed="${libraryFilter === id}">${label}</button>`).join('')}</div><span class="local-library-note">На этом устройстве</span></div><div id="library-results"></div>`;
+  if (!main.querySelector("#library-results")) main.innerHTML = `<div class="page-heading"><div><span class="eyebrow">ТО, ЧТО БЛИЗКО</span><h1>Медиатека</h1></div><div class="heading-actions">${windowsDesktop?'<a class="secondary-button" href="#/downloads">Скачанное</a>':''}<a class="secondary-button library-settings" href="#/settings" aria-label="Настройки" title="Настройки">${icon('settings-2')}</a><button class="secondary-button" data-action="import" aria-label="Импорт коллекции">${icon('import')}<span>Импорт</span></button><button class="secondary-button" data-action="new-playlist" aria-label="Создать плейлист">${icon('plus')}<span>Плейлист</span></button></div></div><div class="filter-row"><div class="tab-pill-group" role="group" aria-label="Раздел медиатеки">${[['all','Всё'],['playlists','Плейлисты'],['likes','Мне нравится'],['artists','Исполнители']].map(([id,label])=>`<button class="chip ${libraryFilter === id ? 'selected' : ''}" data-action="library-filter" data-filter="${id}" aria-pressed="${libraryFilter === id}">${label}</button>`).join('')}</div><span class="local-library-note">В вашем аккаунте</span></div><div id="library-results"></div>`;
   const group = main.querySelector<HTMLElement>('.tab-pill-group')!;
   selectPillButton(group, 'data-filter', libraryFilter);
   const results = main.querySelector<HTMLElement>('#library-results')!;
@@ -446,7 +544,7 @@ function libraryView(): void {
 function historyView(): void {
   hydrateSavedCredits(library.history);
   visibleTracks=library.history;
-  main.innerHTML=`<div class="page-heading"><div><span class="eyebrow">ВАША МУЗЫКА</span><h1>История</h1></div>${library.history.length?'<div class="history-heading-actions"><button class="text-button" data-action="clear-listening-history">Очистить</button><button class="primary-button" data-action="play-list">'+icon('play')+'Слушать</button></div>':''}</div><p class="results-caption">Последние 100 разных песен · на этом устройстве</p>${library.history.length?rows(library.history,100):empty('Здесь пока тихо','Включите музыку — прослушанные песни появятся здесь.','music-2','<a class="primary-button" href="#/search">Найти музыку</a>')}`;
+  main.innerHTML=`<div class="page-heading"><div><span class="eyebrow">ВАША МУЗЫКА</span><h1>История</h1></div>${library.history.length?'<div class="history-heading-actions"><button class="text-button" data-action="clear-listening-history">Очистить</button><button class="primary-button" data-action="play-list">'+icon('play')+'Слушать</button></div>':''}</div><p class="results-caption">Последние 100 разных песен</p>${library.history.length?rows(library.history,100):empty('Здесь пока тихо','Включите музыку — прослушанные песни появятся здесь.','music-2','<a class="primary-button" href="#/search">Найти музыку</a>')}`;
   hydrateIcons(main);
 }
 const translationLabels:Record<TranslationProvider,string>={mymemory:'MyMemory · бесплатно',deepseek:'ИИ',google:'Google Переводчик',deepl:'DeepL'};
@@ -476,7 +574,7 @@ function mountTranslationSettings(): void {
 }
 function settings(): void {
   closeTranslationMenus?.();
-  main.innerHTML = `<div class="page-heading"><div><span class="eyebrow">ВАШЕ ПРОСТРАНСТВО</span><h1>Настройки</h1></div></div><div class="settings-content"><button class="profile-summary" data-action="account"><span class="profile-avatar" data-account-avatar>${accountAvatar()}</span><span><strong>${authUser?e(authUser.first_name||authUser.username||"Мой профиль"):"Мой профиль"}</strong><small>${authUser?"Telegram подключён":"Войти через Telegram"}</small></span>${icon('chevron-right')}</button><section class="settings-group"><h2>Оформление</h2><div class="setting-row"><div class="setting-label">${icon('palette')}<span>Тема</span></div><div class="segmented tab-pill-group" role="group" aria-label="Цветовая тема"><button data-action="theme" data-theme="dark" class="${library.settings.theme === 'dark' ? 'selected' : ''}" aria-pressed="${library.settings.theme === 'dark'}">Тёмная</button><button data-action="theme" data-theme="light" class="${library.settings.theme === 'light' ? 'selected' : ''}" aria-pressed="${library.settings.theme === 'light'}">Светлая</button></div></div><label class="setting-row"><span class="setting-label">${icon('waves')}<span><span id="animations-label">Анимации</span><small id="animations-description">Живая волна и анимация интерфейса</small></span></span><span class="spring-switch"><input id="animations" type="checkbox" role="switch" aria-labelledby="animations-label" aria-describedby="animations-description" ${library.settings.animations ? 'checked' : ''}><span class="spring-switch-thumb" aria-hidden="true"></span></span></label></section><section class="settings-group"><h2>Воспроизведение</h2><label class="setting-row crossfade-setting"><span class="setting-label"><span><span id="crossfade-label">Плавный переход</span><small id="crossfade-description">Новый трек начинает звучать перед концом предыдущего</small></span></span>${jellySlider(library.settings.crossfade)}</label></section><section class="settings-group"><h2>Тексты песен</h2><div class="setting-row"><span class="setting-label">${icon('mic-2')}Сервис перевода</span>${translationTrigger('translation-provider', 'Сервис перевода', translationLabels[library.settings.translation])}</div><div class="setting-row"><span class="setting-label">Язык перевода</span>${translationTrigger('translation-language', 'Язык перевода', languageName(library.settings.translationLanguage))}</div></section><section class="settings-group"><h2>Рекомендации</h2><div class="setting-row"><span class="setting-label">${icon('waves')}<span>Любимые исполнители<small>Помогите волне лучше узнать вас</small></span></span><button class="text-button" data-action="favorite-artists">Выбрать ${icon('chevron-right')}</button></div><div class="setting-row"><span class="setting-label">${icon('thumbs-down')}<span>Не рекомендовать</span></span><button class="text-button" data-action="blocked-tracks">Посмотреть список ${icon('chevron-right')}</button></div></section><section class="settings-group"><h2>Медиатека</h2><div class="setting-row"><span class="setting-label">${icon('library')}<span>Ваша коллекция<small>${library.likes.length} любимых · ${library.playlists.length} плейлистов</small></span></span><button class="text-button" data-action="export">Сохранить копию ${icon('download')}</button></div><div class="setting-row"><span class="setting-label">${icon('import')}<span>Перенос музыки</span></span><button class="text-button" data-action="import">Открыть ${icon('arrow-right')}</button></div></section><div class="settings-about">${icon('audio-lines')}<span><strong>YaMusic</strong><small>В вашем ритме · версия 0.1</small></span></div></div>`;
+  main.innerHTML = `<div class="page-heading"><div><span class="eyebrow">ВАШЕ ПРОСТРАНСТВО</span><h1>Настройки</h1></div></div><div class="settings-content"><button class="profile-summary" data-action="account"><span class="profile-avatar" data-account-avatar>${accountAvatar()}</span><span><strong>${authUser?e(authUser.first_name||authUser.username||"Мой профиль"):"Мой профиль"}</strong><small>${authUser?"Telegram подключён":"Войти через Telegram"}</small></span>${icon('chevron-right')}</button><section class="settings-group"><h2>Оформление</h2><div class="setting-row"><div class="setting-label">${icon('palette')}<span>Тема</span></div><div class="segmented tab-pill-group" role="group" aria-label="Цветовая тема"><button data-action="theme" data-theme="dark" class="${library.settings.theme === 'dark' ? 'selected' : ''}" aria-pressed="${library.settings.theme === 'dark'}">Тёмная</button><button data-action="theme" data-theme="light" class="${library.settings.theme === 'light' ? 'selected' : ''}" aria-pressed="${library.settings.theme === 'light'}">Светлая</button></div></div><label class="setting-row"><span class="setting-label">${icon('waves')}<span><span id="animations-label">Анимации</span><small id="animations-description">Живая волна и анимация интерфейса</small></span></span><span class="spring-switch"><input id="animations" type="checkbox" role="switch" aria-labelledby="animations-label" aria-describedby="animations-description" ${library.settings.animations ? 'checked' : ''}><span class="spring-switch-thumb" aria-hidden="true"></span></span></label></section><section class="settings-group"><h2>Воспроизведение</h2><label class="setting-row crossfade-setting"><span class="setting-label"><span><span id="crossfade-label">Плавный переход</span><small id="crossfade-description">Новый трек начинает звучать перед концом предыдущего</small></span></span>${jellySlider(library.settings.crossfade)}</label></section><section class="settings-group"><h2>Тексты песен</h2><div class="setting-row"><span class="setting-label">${icon('mic-2')}Сервис перевода</span>${translationTrigger('translation-provider', 'Сервис перевода', translationLabels[library.settings.translation])}</div><div class="setting-row"><span class="setting-label">Язык перевода</span>${translationTrigger('translation-language', 'Язык перевода', languageName(library.settings.translationLanguage))}</div></section><section class="settings-group"><h2>Рекомендации</h2><div class="setting-row"><span class="setting-label">${icon('waves')}<span>Любимые исполнители<small>Помогите волне лучше узнать вас</small></span></span><button class="text-button" data-action="favorite-artists">Выбрать ${icon('chevron-right')}</button></div><div class="setting-row"><span class="setting-label">${icon('thumbs-down')}<span>Не рекомендовать</span></span><button class="text-button" data-action="blocked-tracks">Посмотреть список ${icon('chevron-right')}</button></div></section><section class="settings-group"><h2>Медиатека</h2><div class="setting-row"><span class="setting-label">${icon('library')}<span>Ваша коллекция<small>${library.likes.length} любимых · ${library.playlists.length} плейлистов</small></span></span><button class="text-button" data-action="export">Сохранить копию ${icon('download')}</button></div><div class="setting-row"><span class="setting-label">${icon('import')}<span>Перенос музыки</span></span><button class="text-button" data-action="import">Открыть ${icon('arrow-right')}</button></div></section>${desktopSettings()}<div class="settings-about">${icon('audio-lines')}<span><strong>YaMusic</strong><small>В вашем ритме · версия 0.1</small></span></div></div>`;
   hydrateIcons(main);
   syncTabPill(main.querySelector<HTMLElement>('.tab-pill-group')!);
   mountJellySlider(main.querySelector<HTMLInputElement>('#crossfade')!);
@@ -488,8 +586,16 @@ async function detail(kind: string, id: string, gen: number): Promise<void> {
   main.innerHTML = loading();
   try {
     if (kind === 'daily') {
-      const data=await getDaily();if(gen!==generation)return;visibleTracks=register(data.tracks);
-      main.innerHTML=`<div class="collection-header"><div class="collection-art mood-art evening">${icon('audio-lines')}</div><div><span class="eyebrow">КАЖДЫЙ ДЕНЬ ЗАНОВО</span><h1>Микс дня</h1><p>${trackCount(data.tracks.length)} · ${data.personalized?'для вашего вкуса':'пока знакомимся с вами'}</p><button class="primary-button" data-action="play-list" ${data.tracks.length?'':'disabled'}>${icon('play')}Слушать всё</button></div></div>${rows(data.tracks)}`;
+      const data=personalMixes??await getMixes();
+      if(gen!==generation)return;
+      const mix=data.mixes.find(item=>item.id===(id||'daily'));
+      if(!mix){main.innerHTML=empty('Подборка не найдена','','list-music');return;}
+      visibleTracks=mix.tracks;
+      const message=mix.id==='artist'||mix.id==='style'
+        ? 'Послушайте музыку и отмечайте любимое, чтобы появилась подборка.'
+        : 'Подборка ещё готовится.';
+      document.querySelector('.topbar-title')!.textContent=mix.title;
+      main.innerHTML=`<div class="collection-header"><div class="collection-art mood-art evening">${mix.tracks[0]?.cover_url?image(mix.tracks[0].cover_url):icon('audio-lines')}</div><div><h1>${e(mix.title)}</h1><p>${e(mix.description)} · ${trackCount(mix.tracks.length)}</p><button class="primary-button" data-action="play-list" ${mix.tracks.length?'':'disabled'}>${icon('play')}Слушать всё</button></div></div>${mix.tracks.length?rows(mix.tracks):`<p class="muted">${message}</p>`}`;
     } else if (kind === 'playlist') {
       const p = library.playlists.find(item => item.id === id);
       if (!p) { main.innerHTML = empty('Плейлист не найден', 'Возможно, его уже удалили.', 'list-music'); return; }
@@ -500,7 +606,7 @@ async function detail(kind: string, id: string, gen: number): Promise<void> {
             ${p.description ? `<p class="playlist-description">${e(p.description)}</p>` : ''}
             <p data-playlist-count></p>
             <div class="collection-actions"><button class="primary-button" data-action="play-list">${icon('play')}Слушать</button>
-              <button class="secondary-button" data-action="rename-playlist" data-id="${e(p.id)}">Редактировать</button>
+              ${downloadListButton()}<button class="secondary-button" data-action="rename-playlist" data-id="${e(p.id)}">Редактировать</button>
               ${button('delete-playlist','trash-2','Удалить плейлист',`data-id="${e(p.id)}"`)}
             </div>
           </div>
@@ -538,14 +644,14 @@ async function detail(kind: string, id: string, gen: number): Promise<void> {
 function navigate(): void {
   if(!authUser)return;
   closeTranslationMenus?.(); closeTranslationMenus = undefined;
-  closePlaylistMenu();closeSongActions();neuroRequest?.abort();currentPlaylist=undefined;playlistSuggestions=[];
-  if(currentView==='search'&&searchResults)rememberCurrentSearch();
+  closePlaylistMenu();closeSongActions();currentPlaylist=undefined;playlistSuggestions=[];
+    if(currentView==='search'&&searchResults)rememberCurrentSearch();
   generation++; searchRequest?.abort(); clearTimeout(searchTimer); wave?.destroy(); wave = undefined;
   const parts = location.hash.replace(/^#\/?/, '').split('/');
   const page = parts[0] || 'home';
   currentView = page;
   updateBackButton(page);
-  const navPage = ['album','artist','mood'].includes(page) ? 'search' : ['playlist','history'].includes(page) ? 'library' : page==='daily'?'home':page;
+  const navPage = ['album','artist','mood'].includes(page) ? 'search' : ['playlist','history','downloads'].includes(page) ? 'library' : page==='daily'?'home':page;
   document.querySelectorAll<HTMLElement>('[data-page]').forEach(link => {
     const selected = link.dataset.page === navPage;
     link.classList.toggle('selected', selected);
@@ -553,11 +659,12 @@ function navigate(): void {
   });
   syncTabPill(app.querySelector<HTMLElement>('.desktop-navigation')!, true);
   syncTabPill(mobileNav, true);
-  document.querySelector('.topbar-title')!.textContent = ({home:'Для вас',search:'Поиск',library:'Медиатека',settings:'Настройки',album:'Альбом',artist:'Исполнитель',playlist:'Плейлист',mood:'Подборка',daily:'Микс дня',history:'История'} as Record<string,string>)[page] || 'YaMusic';
+  document.querySelector('.topbar-title')!.textContent = ({home:'Для вас',search:'Поиск',library:'Медиатека',settings:'Настройки',album:'Альбом',artist:'Исполнитель',playlist:'Плейлист',mood:'Подборка',daily:'Подборка',history:'История',downloads:'Скачанное'} as Record<string,string>)[page] || 'YaMusic';
   main.className = `view-${page}`; main.scrollTop = 0; visibleTracks = [];
   if (page === 'home') home(); else if (page === 'search') search(); else if (page === 'library') libraryView(); else if (page === 'settings') settings();
   else if(page==='history')historyView();
-  else if(page==='daily')void detail('daily','',generation);
+  else if(page==='downloads'&&windowsDesktop)downloadsView();
+  else if(page==='daily')void detail('daily',location.hash.split('/')[2]||'daily',generation);
   else if (['album','artist','playlist','mood'].includes(page) && parts[1]) {
     let id; try { id = decodeURIComponent(parts.slice(1).join('/')); } catch { id = ''; }
     void detail(page, id, generation);
@@ -591,14 +698,40 @@ function volumeControl(): string {
     ${playerRange('volume', player.volume, 1)}
   </div>`;
 }
+function syncDeviceLabels(): void {
+  const state=playbackDevices?.state;
+  const active=state?.active;
+  const activeName=active?(active===playbackDevices?.id?'здесь':state?.devices?.[active]?.label):undefined;
+  const label=activeName?(state?.playback?.playing?`Играет: ${activeName}`:`На паузе: ${activeName}`):'Устройства';
+  for(const control of document.querySelectorAll<HTMLElement>('[data-action="devices"]')){
+    control.title=label;control.setAttribute('aria-label',label);
+  }
+  for(const status of document.querySelectorAll<HTMLElement>('[data-device-status]')){
+    status.textContent=active?label:'';
+    status.title=active?label:'';
+  }
+  if(dialog.open&&dialog.classList.contains('devices-dialog'))renderDeviceList();
+}
+
+function renderDeviceList(): void {
+  const target=dialog.querySelector<HTMLElement>('[data-device-list]');
+  if(!target)return;
+  const state=playbackDevices?.state;
+  const markup=state?Object.entries(state.devices).map(([id,device])=>{
+    const selected=state.active===id;
+    return `<button class="secondary-button device-option" data-action="transfer-device" data-id="${e(id)}" ${selected||!state.playback?'disabled':''}>${icon('monitor-speaker')}<span>${id===playbackDevices?.id?'Это устройство':e(device.label)}</span>${selected?'<small>Воспроизведение</small>':''}</button>`;
+  }).join(''):'<p class="muted">Подключаемся…</p>';
+  if(target.dataset.markup===markup)return;
+  target.dataset.markup=markup;target.innerHTML=markup;hydrateIcons(target);
+}
 
 function renderPlayer(): void {
   const t = player.current;
   playerBar.classList.toggle('has-track', !!t);
-  playerBar.innerHTML = `<div class="player-information"><button class="player-art" data-action="expand" ${t ? '' : 'disabled'} aria-label="Открыть плеер">${t ? image(t.cover_url, '', '', true) : icon('disc-3')}</button><div class="player-track-name">${t ? `<button class="player-name-link" data-action="expand"><span class="moving-title-text">${e(t.title)}</span></button><span class="mobile-track-artist">${e(trackArtists(t).map(a=>a.name).join(', '))}</span>${artistLinks(t, "player-artist-link")}` : '<strong>С чего начнём?</strong><span>Найдите музыку по настроению</span>'}</div><button class="icon-button like-button player-like" data-action="like-current" aria-label="В любимое" ${t ? '' : 'disabled'}>${icon('heart')}</button>${t ? button('add-playlist-menu','plus','Добавить в плейлист',`data-id="${e(t.id)}" aria-expanded="false" aria-controls="playlist-menu" data-player-add`) : ''}</div><div class="player-transport"><div class="transport-buttons"><button class="icon-button shuffle-button" data-action="shuffle" aria-label="Перемешать" aria-pressed="${player.shuffle}">${icon('shuffle')}</button>${button('previous','skip-back','Предыдущий трек')}<button class="transport-play" data-action="toggle" aria-label="Воспроизвести">${icon('play')}</button>${button('next','skip-forward','Следующий трек')}<button class="icon-button repeat-button" data-action="repeat" aria-label="Повтор выключен">${icon('repeat')}</button></div><div class="player-timeline"><span data-elapsed>0:00</span>${playerRange('seek', player.time, player.duration, !t)}<span data-duration>${formatTime(player.duration)}</span></div></div><div class="player-end">${volumeControl()}<div class="player-extras">${button('lyrics','mic-2','Текст песни')}${button('queue','list-music','Очередь','aria-controls="playback-queue" aria-expanded="false"')}</div></div><div class="mobile-player-actions"><button class="icon-button" data-action="toggle" aria-label="Воспроизвести" data-mobile-play>${icon('play')}</button></div><div class="mobile-progress">${playerRange('seek', player.time, player.duration, !t)}</div>`;
+  playerBar.innerHTML = `<div class="player-information"><button class="player-art" data-action="expand" ${t ? '' : 'disabled'} aria-label="Открыть плеер">${t ? image(t.cover_url, '', '', true) : icon('disc-3')}</button><div class="player-track-name">${t ? `<button class="player-name-link" data-action="expand"><span class="moving-title-text">${e(t.title)}</span></button><span class="mobile-track-artist">${e(trackArtists(t).map(a=>a.name).join(', '))}</span>${artistLinks(t, "player-artist-link")}<span class="mobile-device-status" data-device-status></span>` : '<strong>С чего начнём?</strong><span>Найдите музыку по настроению</span>'}</div><button class="icon-button like-button player-like" data-action="like-current" aria-label="В любимое" ${t ? '' : 'disabled'}>${icon('heart')}</button>${t ? button('add-playlist-menu','plus','Добавить в плейлист',`data-id="${e(t.id)}" aria-expanded="false" aria-controls="playlist-menu" data-player-add`) : ''}</div><div class="player-transport"><div class="transport-buttons"><button class="icon-button shuffle-button" data-action="shuffle" aria-label="Перемешать" aria-pressed="${player.shuffle}">${icon('shuffle')}</button>${button('previous','skip-back','Предыдущий трек')}<button class="transport-play" data-action="toggle" aria-label="Воспроизвести">${icon('play')}</button>${button('next','skip-forward','Следующий трек')}<button class="icon-button repeat-button" data-action="repeat" aria-label="Повтор выключен">${icon('repeat')}</button></div><div class="player-timeline"><span data-elapsed>0:00</span>${playerRange('seek', player.time, player.duration, !t)}<span data-duration>${formatTime(player.duration)}</span></div></div><div class="player-end"><span class="device-status" data-device-status></span>${volumeControl()}<div class="player-extras">${button('devices','monitor-speaker','Устройства')}${button('lyrics','mic-2','Текст песни')}${button('queue','list-music','Очередь','aria-controls="playback-queue" aria-expanded="false"')}</div></div><div class="mobile-player-actions">${!localDesktop?button('devices','monitor-speaker','Устройства'):''}<button class="icon-button" data-action="toggle" aria-label="Воспроизвести" data-mobile-play>${icon('play')}</button></div><div class="mobile-progress">${playerRange('seek', player.time, player.duration, !t)}</div>`;
   mountPlayerRanges(playerBar);
   if(playlistMenuTrigger&&!playlistMenuTrigger.isConnected)closePlaylistMenu();
-  updatePlayerControls(); updateQueueButtons(); hydrateIcons(playerBar); updateProgress();
+  updatePlayerControls(); updateQueueButtons(); hydrateIcons(playerBar); updateProgress(); syncDeviceLabels();
 }
 function replaceIcon(el: HTMLElement | null, name: string): void {
   if (!el || el.dataset.glyph === name) return;
@@ -670,7 +803,7 @@ function like(track?: Track): void {
   library.likes = exists ? library.likes.filter(t=>t.id !== track.id) : [track,...library.likes];
   void api.react({track_id:track.id,action:exists?'unlike':'like',session_id:player.context});
   if(player.context)void refreshWave();else waveQueue=undefined;
-  dailyMix=undefined;
+  personalMixes=undefined;
   if (save() && !exists) celebrateWave();
   updateLikes(); toast(exists ? 'Песня удалена из любимого' : 'Песня сохранена в любимом');
   if (currentView === 'library') libraryView();
@@ -692,9 +825,77 @@ function showDialog(title: string, content: string, cls = ''): void {
 }
 function resetAccountRecommendations():void {
   renderAccountAvatars();authEpoch++;profileReady=undefined;waveQueue=undefined;wavePromise=undefined;
-  dailyMix=undefined;dailyPromise=undefined;discovery=[];discoveryPromise=undefined;disliked.clear();lastAnalyzedCount=0;
+  personalMixes=undefined;mixesPromise=undefined;discovery=[];discoveryPromise=undefined;disliked.clear();lastAnalyzedCount=0;
   player.context=undefined;recommendationUpdate=Promise.resolve();
   waveContinuation=undefined;failedWaveTracks.clear();
+}
+function openAccountLibrary(user: AuthUser): void {
+  if(libraryUser===user.id&&librarySync)return;
+  librarySync?.close();
+  const legacy=restoreLibrary(localStorage.getItem(STORAGE_KEY));
+  const legacySearch=restoreSearchHistory(localStorage.getItem(SEARCH_HISTORY_KEY));
+  const local=localStorage.getItem(`${STORAGE_KEY}.${user.id}`);
+  const deviceVolume=library.settings.volume;
+  library=restoreLibrary(local);
+  if(local===null)library.settings.volume=deviceVolume;
+  searchHistory=restoreSearchHistory(localStorage.getItem(`${SEARCH_HISTORY_KEY}.${user.id}`));
+  libraryUser=user.id;
+  player.setVolume(library.settings.volume);
+  player.setCrossfade(library.settings.crossfade);
+  applySettings();
+  const migratedKey='yamusic.library-legacy-account.v1';
+  const migrationKey=`${migratedKey}.${user.id}`;
+  const owner=localStorage.getItem(migratedKey);
+  const canMigrate=(!owner||owner===String(user.id))&&localStorage.getItem(migrationKey)!=='done'&&localStorage.getItem(STORAGE_KEY)!==null;
+  const sync=new LibrarySync(user.id,(snapshot,pending)=>{
+    if(librarySync!==sync)return;
+    const next=applyAccountLibrary(snapshot,library.settings.volume,pending);
+    const before=JSON.stringify(library);
+    const sameSearch=JSON.stringify(searchHistory)===JSON.stringify(next.searchHistory);
+    const settingsChanged=JSON.stringify(library.settings)!==JSON.stringify(next.library.settings);
+    disliked=new Set(snapshot.dislikes);
+    library=next.library;
+    searchHistory=next.searchHistory;
+    sync.observe(library,searchHistory);
+    if(canMigrate&&!pending.some(change=>change.import_legacy)) localStorage.setItem(migrationKey,'done');
+    if(before===JSON.stringify(library)&&sameSearch)return;
+    save();
+    saveSearchHistory();
+    register([...library.likes,...library.history,...library.playlists.flatMap(item=>item.tracks)]);
+    if(settingsChanged){player.setCrossfade(library.settings.crossfade);applySettings();}
+    updateLikes();
+    if(currentView==='library')libraryView();
+    else if(currentView==='history')historyView();
+    else if(currentView==='settings'&&settingsChanged&&!dialog.open&&!main.contains(document.activeElement))settings();
+    else if(currentView==='playlist'&&!dialog.open){
+      const id=decodeURIComponent(location.hash.split('/')[2]||'');
+      const nextPlaylist=library.playlists.find(item=>item.id===id);
+      if(nextPlaylist) updatePlaylistContents(nextPlaylist);
+      else void detail('playlist',id,generation);
+    } else if(currentView==='home') drawRecent();
+    else if(currentView==='search'&&!searchQuery&&!sameSearch) drawSearchStart();
+  });
+  librarySync=sync;
+  if(canMigrate){
+    localStorage.setItem(migratedKey,String(user.id));
+    const receiptKey='yamusic.library-legacy-receipt.v1';
+    const receipt=localStorage.getItem(receiptKey)||crypto.randomUUID();
+    localStorage.setItem(receiptKey,receipt);
+    library={...legacy,settings:{...legacy.settings,volume:library.settings.volume}};
+    player.setCrossfade(library.settings.crossfade);
+    applySettings();
+    searchHistory=legacySearch;
+    sync.seed(legacy,legacySearch,receipt);
+  }
+  sync.observe(library,searchHistory);
+  sync.refresh();
+}
+
+function drawRecent(): void {
+  const section=document.querySelector<HTMLElement>('#recent-section');
+  if(!section)return;
+  section.innerHTML=library.history.length?sectionHeading('Недавно слушали','<a class="text-button" href="#/history">Вся история '+icon('arrow-right')+'</a>')+rows(library.history,4):'';
+  hydrateIcons(section);
 }
 const loginScreen=app.querySelector<HTMLElement>('.login-screen')!;
 const shell=app.querySelector<HTMLElement>('.app-shell')!;
@@ -708,6 +909,12 @@ function renderSession(): void {
   const skipLink=app.querySelector<HTMLElement>('.skip-link')!;
   skipLink.hidden=!authUser;
   if(authUser){
+    openAccountLibrary(authUser);
+    playbackDevices??=new PlaybackDevices(player,syncDeviceLabels,updateProgress,toast);
+    if(windowsDesktop&&!downloads){
+      const account=authUser.id;
+      void invokeDesktop('offline_set_account',{account}).then(()=>{if(authUser?.id===account)return openDownloads(account);}).catch(()=>{});
+    }
     loginScreen.querySelector('#telegram-login-widget')!.replaceChildren();
     navigate();
     const returned=new URL(location.href);
@@ -720,11 +927,15 @@ function renderSession(): void {
     void restorePlayback(authUser.id);
     return;
   }
+  playbackDevices?.close();playbackDevices=undefined;
+  downloads=undefined;
+  librarySync?.close();librarySync=undefined;libraryUser=undefined;
+  library=restoreLibrary(null);searchHistory=[];searchResults=undefined;searchQuery='';
   if(dialog.open)dialog.close();
   closeQueue(); closePlaylistMenu(); closeSongActions();
   closeTranslationMenus?.(); closeTranslationMenus = undefined;
   wave?.destroy(); wave=undefined;
-  generation++; searchRequest?.abort(); neuroRequest?.abort();
+  generation++; searchRequest?.abort();
   main.replaceChildren();
   const target=loginScreen.querySelector<HTMLElement>('#telegram-login-widget')!;
   target.replaceChildren();
@@ -770,7 +981,7 @@ function startSession(): void {
 function account(): void {
   if(!authUser)return;
   const name=authUser.first_name||authUser.username||'Слушатель';
-  showDialog('Мой профиль',`<div class="account-dialog"><div class="account-emblem">${authUser.avatar_url?image(authUser.avatar_url,name,'account-avatar',true):icon('circle-user-round')}</div><h3>${e(name)}</h3>${authUser.username?`<p class="account-username">@${e(authUser.username)}</p>`:''}<span class="account-connected">${icon('send')}Telegram подключён</span><dl class="account-details"><div><dt>Telegram ID</dt><dd>${e(String(authUser.telegram_id))}</dd></div></dl><p>Рекомендации и позиция воспроизведения привязаны к вашему профилю. Любимое, плейлисты и настройки пока сохраняются в этом браузере.</p><button class="secondary-button" data-action="auth-logout">Выйти из профиля</button></div>`,'account-profile-dialog');
+  showDialog('Мой профиль',`<div class="account-dialog"><div class="account-emblem">${authUser.avatar_url?image(authUser.avatar_url,name,'account-avatar',true):icon('circle-user-round')}</div><h3>${e(name)}</h3>${authUser.username?`<p class="account-username">@${e(authUser.username)}</p>`:''}<span class="account-connected">${icon('send')}Telegram подключён</span><dl class="account-details"><div><dt>Telegram ID</dt><dd>${e(String(authUser.telegram_id))}</dd></div></dl><p>Медиатека, история, настройки и воспроизведение привязаны к вашему профилю.</p><button class="secondary-button" data-action="auth-logout">Выйти из профиля</button></div>`,'account-profile-dialog');
 }
 
 (window as Window & {onYaMusicTelegramAuth?:(user:TelegramLogin)=>void}).onYaMusicTelegramAuth=(payload)=>{
@@ -790,9 +1001,10 @@ async function logoutAccount():Promise<void>{
   if(accountBusy)return;
   accountBusy=true;
   try {
-    player.pause();
+    if(!player.mirroring)player.pause();
     await persistPlayback(true);
     await api.authLogout();
+    if(windowsDesktop)await invokeDesktop('offline_set_account',{account:null}).catch(()=>{});
     authUser=null;
     resetAccountRecommendations();
     player.reset(); renderPlayer(); renderSession();
@@ -812,7 +1024,7 @@ async function restorePlayback(user: number): Promise<void> {
     }
   } catch { /* The server can restore playback without the browser copy. */ }
   const remote=await api.restorePlayback().catch(()=>null);
-  if(authUser?.id!==user || player.current)return;
+  if(authUser?.id!==user || player.current || playbackDevices?.state?.active)return;
   const saved=local && (!remote || local.captured_at>remote.captured_at) ? local : remote;
   if(!saved)return;
   // Only the server knows whether a restored Wave session still belongs to this account.
@@ -831,7 +1043,7 @@ async function restorePlayback(user: number): Promise<void> {
 
 async function persistPlayback(force = false, initialPosition?: number): Promise<void> {
   const track=player.current,user=authUser;
-  if(!track||!user||restoringPlayback)return;
+  if(!track||!user||restoringPlayback||player.mirroring)return;
   const time=initialPosition ?? player.time;
   const position=Number(Math.min(time,track.duration_sec || time).toFixed(1));
   const queue=player.queue.slice(Math.max(0,player.index-5),player.index+26);
@@ -855,12 +1067,12 @@ function setFollowButton(button:HTMLButtonElement,following:boolean):void {
   button.disabled=false;
 }
 async function refreshArtistPreferences():Promise<void>{
-  await Promise.allSettled([wavePromise,dailyPromise]);
-  waveQueue=undefined;dailyMix=undefined;
+  await Promise.allSettled([wavePromise,mixesPromise]);
+  waveQueue=undefined;personalMixes=undefined;
   if(player.context)void refreshWave();
   if(currentView==='home'){
     if(!player.context)void getWave().then(drawWaveQueue).catch(()=>{});
-    void getDaily().then(drawDaily).catch(()=>{});
+    void getMixes().then(drawMixes).catch(()=>{});
   }
 }
 let renderedQueue = '';
@@ -1001,7 +1213,7 @@ function updatePlaylistContents(playlist: Playlist): void {
   const cover = playlist.cover_url || playlist.tracks[0]?.cover_url;
   art.classList.toggle('empty-playlist-art', !cover);
   art.innerHTML = cover ? image(cover) : icon('list-music');
-  main.querySelector('[data-playlist-count]')!.textContent = `${trackCount(playlist.tracks.length)} · на этом устройстве`;
+  main.querySelector('[data-playlist-count]')!.textContent = trackCount(playlist.tracks.length);
   main.querySelector<HTMLButtonElement>('[data-action="play-list"]')!.disabled = !playlist.tracks.length;
   const list = main.querySelector<HTMLElement>('[data-playlist-tracks]')!;
   list.innerHTML = playlist.tracks.length ? rows(playlist.tracks,playlist.tracks.length) : '';
@@ -1013,7 +1225,7 @@ async function loadPlaylistSuggestions(playlist: Playlist, gen: number): Promise
   const suggestions = main.querySelector<HTMLElement>('[data-playlist-suggestions]')!;
   try {
     let mix: Track[];
-    try { mix = (await getDaily()).tracks; }
+    try { mix = (await getMixes()).mixes[0]?.tracks ?? []; }
     catch { mix = await getDiscovery(); }
     if (gen !== generation || currentPlaylist !== playlist) return;
     playlistSuggestions = mix;
@@ -1056,7 +1268,7 @@ function fullPlayer(lyrics = true): void {
   lyricLines = []; plainLyricLines=[]; activeLyric = -1; followLyrics = true;
   dialog.className = `full-player-dialog${lyrics ? ' show-lyrics' : ''}`;
   dialog.innerHTML = `
-    <div class="expanded-header">
+    <div class="expanded-header">${button('devices','monitor-speaker','Устройства')}<span class="device-status" data-device-status></span>
       ${volumeControl()}
       ${button('collapse-player','chevron-down','Свернуть плеер',alreadyOpen ? '' : 'autofocus')}
     </div>
@@ -1157,7 +1369,9 @@ async function loadLyrics(): Promise<void> {
   stopLyricsScroll(container);
   container.innerHTML=loading(); lyricLines=[]; plainLyricLines=[]; activeLyric=-1;
   try {
-    const data=await retryLyrics(() => api.lyrics(t.id,controller.signal),controller.signal);
+    const cached=downloads?.entries[t.id]?.lyrics;
+    if(localDesktop&&!cached)throw new Error('Текст этой песни не скачан.');
+    const data=cached??await retryLyrics(() => api.lyrics(t.id,controller.signal),controller.signal);
     if(controller.signal.aborted || player.current?.id!==t.id || !dialog.open || !container.isConnected) return;
     lyricLines=data.instrumental?[]:parseLrc(data.synced_lrc||'');
     if(!lyricLines.length&&!data.instrumental&&data.plain_lyrics)plainLyricLines=data.plain_lyrics.split(/\r?\n/).map(line=>line.trim());
@@ -1171,7 +1385,7 @@ async function loadLyrics(): Promise<void> {
     else if(isPlain) container.innerHTML=`<div class="plain-lyrics">${plainLyricLines.map((line,i)=>`<p data-plain-line="${i}">${e(line)||'&nbsp;'}</p>`).join('')}</div>`;
     else container.innerHTML=empty('Текст пока не найден','В LRCLIB пока нет текста именно этой версии песни.','mic-2');
     const translate=dialog.querySelector<HTMLButtonElement>('[data-action="translation"]');
-    if(translate)translate.disabled=!lyricLines.length&&!isPlain;
+    if(translate)translate.disabled=localDesktop||(!lyricLines.length&&!isPlain);
     hydrateIcons(container); updateLyrics();
   } catch(error) {
     if(controller.signal.aborted || !container.isConnected) return;
@@ -1475,7 +1689,7 @@ function saveImport(asLikes: boolean): void {
     library.likes=[...added,...before];
     if(!save()){library.likes=before;return;}
     for(const track of added)void api.react({track_id:track.id,action:'like'});
-    dailyMix=undefined;waveQueue=undefined;
+    personalMixes=undefined;waveQueue=undefined;
     dialog.close();libraryFilter='likes';go('library');toast(`Добавлено: ${trackCount(added.length)}`);
     return;
   }
@@ -1524,7 +1738,7 @@ function trackMenu(trigger: HTMLElement, id: string): void {
   trigger.setAttribute('aria-expanded','true');
   songActions.innerHTML = `<header class="song-actions-heading"><strong title="${e(t.title)}">${e(t.title)}</strong><small>${e(t.artist)}</small></header>
     <div class="action-list">
-      <button data-action="like" data-id="${e(id)}">${icon('heart')}${library.likes.some(track=>track.id===id)?'Убрать из любимого':'В любимое'}</button>
+      <button data-action="like" data-id="${e(id)}">${icon('heart')}${library.likes.some(track=>track.id===id)?'Убрать из любимого':'В любимое'}</button>${windowsDesktop&&!localDesktop?`<button data-action="download-track" data-id="${e(id)}">${icon('download')}Скачать</button>`:''}
       <button data-action="dislike" data-id="${e(id)}">${icon('thumbs-down')}${disliked.has(id)?'Снова рекомендовать':'Не нравится'}</button>
       <button data-action="add-playlist-menu" data-id="${e(id)}">${icon('list-plus')}Добавить в плейлист</button>
       <button data-action="artist" data-id="${t.artist_id}">${icon('circle-user-round')}К исполнителю</button>
@@ -1560,9 +1774,6 @@ document.addEventListener('click', async event => {
   const closeForNavigation = () => { if (dialog.open) dialog.close(); };
   if (action === 'play') {
     const track = tracks.get(id); if (track) player.play(track, visibleTracks.length ? visibleTracks : [track]);
-  } else if (action === 'play-neuro') {
-    const track=id?neuroTracks.find(item=>item.id===id):neuroTracks[0];
-    if(track)player.play(track,neuroTracks);
   } else if (action === 'play-queued') {
     player.playQueued(Number(target.dataset.index));
   } else if (action === 'preview-playlist-candidate') {
@@ -1570,12 +1781,31 @@ document.addEventListener('click', async event => {
     if (track) player.play(track);
   } else if(action==='play-wave-track'){
     const data=await getWave(),track=tracks.get(id);if(track)player.play(track,data.tracks,data.session_id);
-  } else if(action==='play-daily-track'){
-    const data=await getDaily(),track=tracks.get(id);if(track)player.play(track,data.tracks);
+  } else if(action==='download-track'){
+    const track=tracks.get(id);
+    if(track)void queueDownloads([track],target);
+  } else if(action==='download-list'){
+    const mix=currentView==='daily'?personalMixes?.mixes.find(mix=>mix.id===(location.hash.split('/')[2]||'daily')):undefined;
+    const playlist=currentView==='playlist'?currentPlaylist:mix?{id:`mix-${mix.id}`,title:mix.title}:undefined;
+    void queueDownloads(visibleTracks,target,playlist);
+  } else if(action==='downloads-folder'){
+    void downloads?.chooseFolder().then(()=>{if(currentView==='downloads')downloadsView();else if(currentView==='settings')settings();}).catch(error=>toast(String(error)));
+  } else if(action==='remove-download'){
+    void downloads?.remove(id).then(()=>{if(currentView==='downloads')downloadsView();}).catch(error=>toast(String(error)));
+  } else if(action==='open-offline'){
+    void invokeDesktop('open_offline').catch(error=>toast(String(error)));
+  } else if(action==='install-update'){
+    void persistPlayback(true).finally(()=>invokeDesktop('install_update')).catch(error=>toast(String(error)));
+  } else if(action==='dismiss-update'){
+    target.closest('.desktop-update')?.remove();
+  } else if (action === 'devices') {
+    showDialog('Устройства', '<div class="device-list" data-device-list></div>', 'devices-dialog');renderDeviceList();
+  } else if (action === 'transfer-device') {
+    playbackDevices?.transfer(id);dialog.close();
   } else if (action === 'toggle') { if (player.current) player.toggle(); else toast('Выберите песню в каталоге'); }
-  else if (action === 'wave' || action === 'daily') {
+  else if (action === 'wave') {
     if(action==='wave'&&player.context&&player.current)player.toggle();
-    else{target.setAttribute('disabled','');try{if(action==='wave'){failedWaveTracks.clear();const data=await getWave();if(data.tracks[0])player.play(data.tracks[0],data.tracks,data.session_id);else toast('Сначала найдите и отметьте любимую музыку');}else{const data=await getDaily();if(data.tracks[0])player.play(data.tracks[0],data.tracks);}}catch(error){toast(error instanceof Error?error.message:'Рекомендации недоступны');}finally{target.removeAttribute('disabled');}}
+    else{target.setAttribute('disabled','');try{failedWaveTracks.clear();const data=await getWave();if(data.tracks[0])player.play(data.tracks[0],data.tracks,data.session_id);else toast('Сначала найдите и отметьте любимую музыку');}catch(error){toast(error instanceof Error?error.message:'Рекомендации недоступны');}finally{target.removeAttribute('disabled');}}
   } else if (action === 'next') player.next();
   else if (action === 'previous') player.previous();
   else if (action === 'shuffle') {
@@ -1583,19 +1813,19 @@ document.addEventListener('click', async event => {
     savePlaybackModes();
   }
   else if (action === 'repeat') { player.toggleRepeat(); savePlaybackModes(); }
-  else if (action === 'mute') { if (player.volume > 0) { lastVolume = player.volume; player.setVolume(0); } else player.setVolume(lastVolume); library.settings.volume = player.volume; save(); }
+  else if (action === 'mute') { if (player.volume > 0) { lastVolume = player.volume; player.setVolume(0); } else player.setVolume(lastVolume); if(!player.mirroring){library.settings.volume = player.volume;save();} }
   else if (action === 'like' || action === 'like-current') like(action === 'like' ? tracks.get(id) : player.current);
   else if(action==='dislike'){
     const track=tracks.get(id);if(track){
       const undo=disliked.has(id);if(undo)disliked.delete(id);else disliked.add(id);
       await api.react({track_id:id,action:undo?'undislike':'dislike',session_id:player.context});
       if(!player.context)waveQueue=undefined;
-      if(dailyMix){if(undo)dailyMix=undefined;else dailyMix.tracks=dailyMix.tracks.filter(t=>t.id!==id);}
+      if(personalMixes){if(undo)personalMixes=undefined;else for(const mix of personalMixes.mixes)mix.tracks=mix.tracks.filter(track=>track.id!==id);}
       if (!fromSongActions) dialog.close();
       toast(undo?'Песня снова может появляться в рекомендациях':'Больше не будем рекомендовать эту песню');
       if(!undo&&player.current?.id===id)player.next(false,false);else if(player.context)refreshWave();
       if(!undo){const current=player.current;player.queue=player.queue.filter(t=>t.id!==id||t===current);player.index=current?player.queue.indexOf(current):-1;}
-      if(currentView==='daily')void detail('daily','',generation);else if(currentView==='home')drawDaily();
+      if(currentView==='daily')void detail('daily',location.hash.split('/')[2]||'daily',generation);else if(currentView==='home')drawMixes();
     }
   }
   else if (action === 'album' || action === 'artist' || action === 'playlist') { event.preventDefault(); closeForNavigation(); go(`${action}/${encodeURIComponent(id)}`); }
@@ -1626,7 +1856,7 @@ document.addEventListener('click', async event => {
   else if(action==='clear-search-history'){searchHistory=[];saveSearchHistory();drawSearchStart();}
   else if(action==='remove-search-history'){searchHistory.splice(Number(target.dataset.index),1);saveSearchHistory();drawSearchStart();}
   else if(action==='clear-listening-history'){showDialog('Очистить историю?', '<p class="dialog-description">Список прослушиваний исчезнет с этого устройства. Любимое и плейлисты сохранятся.</p><div class="dialog-actions"><button class="secondary-button" data-action="close">Отмена</button><button class="primary-button" data-action="confirm-clear-history">Очистить</button></div>');}
-  else if(action==='confirm-clear-history'){library.history=[];save();dialog.close();historyView();}
+  else if(action==='confirm-clear-history'){library.history=[];librarySync?.clearHistory();save();dialog.close();historyView();}
   else if (action === 'choose-playlist-cover') dialog.querySelector<HTMLInputElement>('#playlist-cover-file')?.click();
   else if (action === 'clear-playlist-cover') {
     playlistCoverDraft = '';
@@ -1710,52 +1940,11 @@ document.addEventListener('click', async event => {
     showDialog('Удалить плейлист?',`<p class="dialog-description">Песни останутся в каталоге и в любимом.</p><div class="dialog-actions"><button class="secondary-button" data-action="close">Отмена</button><button class="primary-button" data-action="confirm-delete-playlist" data-id="${e(id)}">Удалить</button></div>`);
   } else if (action === 'confirm-delete-playlist') { library.playlists = library.playlists.filter(p=>p.id !== id); save(); dialog.close(); go('library'); }
 });
-async function playNeuroWave(form: HTMLFormElement): Promise<void> {
-  const input=form.querySelector<HTMLInputElement>('input')!;
-  const query=input.value.trim();
-  if(query.length<2){input.focus();return;}
-  neuroRequest?.abort();
-  neuroTracks=[];
-  main.querySelector<HTMLElement>('#neuro-results')!.hidden=true;
-  const controller=new AbortController();
-  neuroRequest=controller;
-  const trigger=form.querySelector<HTMLButtonElement>('button')!;
-  trigger.disabled=true;
-  const status=document.createElement('p');
-  status.className='neuro-status';
-  status.setAttribute('role','status');
-  status.textContent='Подбираем треки…';
-  form.parentElement?.querySelector('.neuro-status')?.remove();
-  form.after(status);
-  try {
-    const {tracks,reference}=await api.neuroWave(query,controller.signal);
-    if(controller.signal.aborted||!form.isConnected)return;
-    if(!tracks.length){status.textContent='Не нашли подходящих треков. Попробуйте описать настроение иначе.';return;}
-    neuroTracks=register(tracks);
-    api.prepare(tracks.slice(0,3));
-    const results=main.querySelector<HTMLElement>('#neuro-results')!;
-    results.innerHTML=sectionHeading(reference?`Похоже на ${reference}`:'Нейро-волна',
-      '<button class="primary-button" data-action="play-neuro">'+icon('play')+'Слушать</button>',
-      trackCount(tracks.length))+`<div class="track-list">${tracks.map((track,index)=>row(track,index,'play-neuro')).join('')}</div>`;
-    results.hidden=false;
-    hydrateIcons(results);
-    status.remove();
-  } catch(error) {
-    if(!controller.signal.aborted)status.textContent=error instanceof Error?error.message:'Не удалось подобрать треки.';
-  } finally {
-    if(neuroRequest===controller)trigger.disabled=false;
-  }
-}
-
 document.addEventListener('submit', event => {
   const form = event.target as HTMLFormElement;
   if (form.id === 'search-form') { event.preventDefault(); clearTimeout(searchTimer); void runSearch(); }
   else if (form.id === 'lyric-search-form') { event.preventDefault();void findByLyrics(form); }
   else if (form.id === 'music-import-form') { event.preventDefault();void previewImport(form); }
-  else if (form.id === 'neuro-form') {
-    event.preventDefault();
-    void playNeuroWave(form);
-  }
   else if (form.id === 'playlist-form') {
     event.preventDefault(); const title = String(new FormData(form).get('title') || '').trim(); if (!title) return;
     const existing = library.playlists.find(p=>p.id === form.dataset.id), previous=existing?{...existing}:undefined;
@@ -1780,7 +1969,7 @@ document.addEventListener('input', event => {
     player.setCrossfade(seconds);
     save();
   }
-  else if (input.matches('[data-volume]')) { player.setVolume(Number(input.value)); library.settings.volume = player.volume;save(); fillRange(input); showCurrentVolume(input); }
+  else if (input.matches('[data-volume]')) { player.setVolume(Number(input.value)); if(!player.mirroring){library.settings.volume = player.volume;save();} fillRange(input); showCurrentVolume(input); }
   else if (input.matches('[data-seek]')) { player.seek(Number(input.value)); fillRange(input); }
   else if (input.id === 'search-input') { clearTimeout(searchTimer); searchTimer = window.setTimeout(()=>void runSearch(),450); }
   else if (input.id === 'playlist-description') resizePlaylistDescription(input as unknown as HTMLTextAreaElement);
@@ -1869,8 +2058,10 @@ dialog.addEventListener('click', event => {
 });
 function adjustVolume(direction: number, input?: HTMLInputElement | null): void {
   player.setVolume(Math.round((player.volume+direction*.05)*100)/100);
-  library.settings.volume=player.volume;
-  save();
+  if (!player.mirroring) {
+    library.settings.volume=player.volume;
+    save();
+  }
   showCurrentVolume(input);
 }
 let playerSwipe: {id:number;x:number;y:number} | undefined;
@@ -1903,7 +2094,7 @@ document.addEventListener('wheel',event=>{
 },{passive:false});
 document.addEventListener('keydown', event => {
   const target=event.target as HTMLElement;
-  if (!authUser || event.ctrlKey || event.metaKey || event.altKey || (dialog.open&&!dialog.classList.contains('full-player-dialog'))) return;
+  if ((!authUser && !localDesktop) || event.ctrlKey || event.metaKey || event.altKey || (dialog.open&&!dialog.classList.contains('full-player-dialog'))) return;
   if (target.closest('input,textarea,select,[contenteditable]')) {
     if (target instanceof HTMLInputElement && target.matches('[data-volume]') && (event.key==='ArrowUp'||event.key==='ArrowDown')) {
       event.preventDefault();adjustVolume(event.key==='ArrowUp'?1:-1,target);
@@ -1940,7 +2131,7 @@ mobileNav.addEventListener('pointercancel',()=> { navPointer=undefined; mobileNa
 player.addEventListener('change',updatePlayerControls);
 player.addEventListener('tick',()=>{
   updateProgress();
-  if(player.playing)void persistPlayback();
+  if(player.playing&&!player.mirroring)void persistPlayback();
 });
 player.addEventListener('pause',()=>{
   if(player.mode==='full')void persistPlayback(true);
@@ -1998,7 +2189,16 @@ player.addEventListener('trackchange',event=> {
   if(dialog.open && dialog.classList.contains('full-player-dialog')) fullPlayer(dialog.classList.contains('show-lyrics'));
 });
 let historyTrackId='';
-player.addEventListener('playing',()=>{const track=player.current;if(track&&historyTrackId!==track.id){historyTrackId=track.id;library.history=uniqueTracks([track,...library.history]).slice(0,100);save();if(currentView==='history')historyView();else if(currentView==='home'){const section=document.querySelector('#recent-section');if(section){section.innerHTML=sectionHeading('Недавно слушали','<a class="text-button" href="#/history">Вся история '+icon('arrow-right')+'</a>')+rows(library.history,4);hydrateIcons(section as HTMLElement);}}}});
+player.addEventListener('playing',()=>{
+  const track=player.current;
+  if(player.mirroring||!track||historyTrackId===track.id)return;
+  historyTrackId=track.id;
+  library.history=uniqueTracks([track,...library.history]).slice(0,100);
+  librarySync?.heard(track);
+  save();
+  if(currentView==='history')historyView();
+  else if(currentView==='home')drawRecent();
+});
 player.addEventListener('playererror',event=>{
   const current=player.current;
   if(player.context&&current&&player.mode==='unavailable'&&!failedWaveTracks.has(current.id)&&failedWaveTracks.size<5){
@@ -2010,7 +2210,7 @@ player.addEventListener('playererror',event=>{
 });
 player.addEventListener('playing',()=>failedWaveTracks.clear());
 player.addEventListener('playbacknotice',event=>toast((event as CustomEvent<string>).detail));
-window.addEventListener('hashchange',navigate);
+window.addEventListener('hashchange',()=>{if(localDesktop)downloadsView();else navigate();});
 window.addEventListener('yamusic-session-expired',()=>{
   if(!authUser)return;
   authUser=null;resetAccountRecommendations();player.reset();renderPlayer();renderSession();
@@ -2025,4 +2225,19 @@ document.addEventListener('error',event=> {
 },true);
 mountSidebar(app.querySelector<HTMLElement>('.sidebar')!);
 mountPillGroups();
-renderPlayer(); startSession();
+renderPlayer();
+if(localDesktop){
+  shell.hidden=false;loginScreen.hidden=true;
+  document.body.classList.add('offline-desktop');
+  void invokeDesktop<number|null>('offline_account').then(async account=>{
+    if(account!==null)await openDownloads(account);
+    downloadsView();
+  }).catch(error=>toast(String(error)));
+}else{
+  if(windowsDesktop){
+    window.addEventListener('yamusic-update',showUpdateNotification);
+    window.addEventListener('offline',()=>{ if(downloads) void invokeDesktop('open_offline').catch(()=>{}); });
+    void invokeDesktop('desktop_ready').then(showUpdateNotification).catch(()=>{});
+  }
+  startSession();
+}

@@ -17,6 +17,6 @@ Spotify import uses `SPOTIFY_CLIENT_ID` from the Spotify Developer Dashboard. Re
 
 Operational checks: `systemctl status yamusic caddy`, `journalctl -u yamusic`, `curl https://yamusic.pigboss.xyz/api/health`.
 
-Telegram config uses TELEGRAM_BOT_TOKEN, TELEGRAM_BOT_USERNAME and PUBLIC_ORIGIN. Widget authentication verifies Telegram HMAC and five-minute freshness, stores only session token hashes, prevents payload replay, uses HttpOnly/Secure/SameSite=Lax cookies and checks request Origin. `/auth/me` is not cacheable. Signed-in recommendations use the verified session, not the browser-supplied profile ID. Likes/playlists/settings remain local to the browser; cloud library sync is not implemented.
+Telegram config uses TELEGRAM_BOT_TOKEN, TELEGRAM_BOT_USERNAME and PUBLIC_ORIGIN. Widget authentication verifies Telegram HMAC and five-minute freshness, stores only session token hashes, prevents payload replay, uses HttpOnly/Secure/SameSite=Lax cookies and checks request Origin. `/auth/me` is not cacheable. The verified session identifies the account for recommendations, the cloud library, and live playback. Back up the SQLite database before deploying migrations.
 
 The pinned audio-only Python launcher skips SoundCloud original-artwork HEAD probing (other artwork variants and every audio field/validation remain intact). This avoids a measured 20-27s lookup stall; the profile cover comes from Deezer. No third-party package files are modified.

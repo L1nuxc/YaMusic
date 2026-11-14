@@ -143,19 +143,8 @@ pub async fn discover(State(state):State<AppState>,headers:HeaderMap)->Result<Js
 
 pub(crate) struct WavePreferences {
     pub artists: Vec<String>,
-    pub blocked: HashSet<String>,
     favorites: HashSet<i64>,
     centroids: Vec<Vector>,
-}
-
-impl WavePreferences {
-    pub fn affinity(&self, track: &Track, vector: Option<&Vector>) -> f32 {
-        let similarity=vector.and_then(|vector|self.centroids.iter()
-            .map(|center|cosine(vector,center)).max_by(f32::total_cmp)).unwrap_or(0.0).max(0.0);
-        let familiar=self.favorites.contains(&track.artist_id) ||
-            track.contributors.iter().any(|credit|self.favorites.contains(&credit.id));
-        similarity+if familiar {0.2}else{0.0}
-    }
 }
 
 pub(crate) async fn wave_preferences(state:&AppState,user:i64)->Result<WavePreferences,ApiError> {
@@ -166,12 +155,10 @@ pub(crate) async fn wave_preferences(state:&AppState,user:i64)->Result<WavePrefe
         GROUP BY t.artist ORDER BY sum(CASE i.action_type WHEN 'complete' THEN 2 ELSE 1 END) DESC, max(i.id) DESC LIMIT 6")
         .bind(user).fetch_all(&state.db).await?;
     for name in recent { if !artists.contains(&name) { artists.push(name); } }
-    let blocked=sqlx::query_scalar("SELECT track_id FROM user_track_flags WHERE user_id=? AND is_disliked=1")
-        .bind(user).fetch_all(&state.db).await?.into_iter().collect();
     let blobs:Vec<Vec<u8>>=sqlx::query_scalar("SELECT centroid_vector FROM user_taste_clusters WHERE user_id=?")
         .bind(user).fetch_all(&state.db).await?;
     let centroids=blobs.iter().filter_map(|blob|crate::analysis::decode_vector(blob)).collect();
-    Ok(WavePreferences{artists,blocked,favorites:favorites.into_iter().map(|artist|artist.id).collect(),centroids})
+    Ok(WavePreferences{artists,favorites:favorites.into_iter().map(|artist|artist.id).collect(),centroids})
 }
 
 async fn explore_taste(state:&AppState,user:i64)->Result<Option<Value>,ApiError>{
@@ -420,6 +407,124 @@ pub fn smooth_order(mut ranked:Vec<Track>,vectors:&HashMap<String,Vector>,limit:
         let Some(i)=next else{break;};result.push(ranked.remove(i));
     }result
 }
+pub async fn mixes(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
+    let daily = daily(State(state.clone()), headers.clone()).await?.0;
+    let uid = user(&state, &headers).await?;
+    let week: String = sqlx::query_scalar("SELECT date('now', '-6 days', 'weekday 1')")
+        .fetch_one(&state.db).await?;
+    let day = daily["day"].as_str().unwrap_or_default();
+    let top_artist: Option<(i64, String)> = sqlx::query_as(
+        "SELECT t.artist_id, t.artist FROM interactions i JOIN tracks t ON t.id=i.track_id
+         WHERE i.user_id=? AND i.action_type IN ('complete','like') AND i.created_at>=datetime('now','-30 days')
+           AND t.artist_id>0 AND t.artist<>''
+         GROUP BY t.artist_id, t.artist ORDER BY sum(i.action_type='complete') DESC, count(*) DESC, max(i.id) DESC LIMIT 1")
+        .bind(uid).fetch_optional(&state.db).await?;
+    let top_artist = match top_artist {
+        Some(artist) => Some(artist),
+        None => favorite_list(&state, uid).await?.into_iter().next().map(|artist| (artist.id, artist.name)),
+    };
+    let mut artist_candidates = Vec::new();
+    if let Some((id, _)) = &top_artist {
+        let path = format!("/artist/{id}/radio");
+        if let Ok(radio) = state.catalog(&path, &[("limit", "50".into())]).await {
+            artist_candidates.extend(crate::items(&radio).iter().filter_map(crate::normalize_track));
+            crate::save_tracks(&state.db, &artist_candidates).await?;
+        }
+    }
+    let tracks = pool(&state).await?;
+    let counts: HashMap<String, i64> = sqlx::query_as::<_, (String, i64)>(
+        "SELECT track_id, count(*) FROM interactions WHERE user_id=? AND action_type IN ('complete','early_skip') GROUP BY track_id")
+        .bind(uid).fetch_all(&state.db).await?.into_iter().collect();
+    let likes: HashSet<String> = sqlx::query_scalar("SELECT track_id FROM user_track_flags WHERE user_id=? AND is_liked=1")
+        .bind(uid).fetch_all(&state.db).await?.into_iter().collect();
+    let vectors = state.analysis.vectors.read().unwrap().clone();
+    let taste = {
+        let _guard = state.recommendation_lock.lock().await;
+        taste(&state, uid, &vectors).await?
+    };
+    let ranked = rank(&tracks, &taste, &vectors, &WaveState::default());
+    let day_ids: HashSet<_> = daily["tracks"].as_array().into_iter().flatten()
+        .filter_map(|track| track["id"].as_str()).collect();
+    let mut weekly = ranked.clone();
+    weekly.sort_by_key(|track| day_ids.contains(track.id.as_str()));
+    let discovery = ranked.iter().filter(|track| counts.get(&track.id).copied().unwrap_or(0) <= 1 && !likes.contains(&track.id))
+        .cloned().collect();
+    let mut result = vec![json!({"id":"daily","title":"Микс дня","description":"Обновляется каждый день","tracks":daily["tracks"]})];
+    for (kind, title, description, candidates) in [
+        ("weekly", "Микс недели", "Подборка по вашему вкусу", weekly),
+        ("discovery", "Открытие недели", "Музыка, которую вы ещё мало слушали", discovery),
+    ] {
+        let ordered = weekly_tracks(&state, uid, kind, &week, title, candidates, &tracks, &vectors, &taste).await?;
+        result.push(json!({"id":kind,"title":title,"description":description,"tracks":ordered}));
+    }
+    let (artist_title, artist_tracks) = if let Some((id, name)) = top_artist {
+        let seeds: Vec<_> = ranked.iter().filter(|track| track.artist_id == id)
+            .filter_map(|track| vectors.get(&track.id)).take(10).collect();
+        let mut similar: Vec<_> = ranked.iter().filter(|track| track.artist_id != id).filter_map(|track| {
+            let vector = vectors.get(&track.id)?;
+            let match_score = seeds.iter().map(|seed| cosine(vector, seed)).max_by(f32::total_cmp)?;
+            (match_score >= 0.20).then_some((match_score, track.clone()))
+        }).collect();
+        similar.sort_by(|a,b| b.0.total_cmp(&a.0));
+        let mut related = artist_candidates.into_iter()
+            .filter(|track| track.artist_id != id && !taste.blocked.contains(&track.id)).collect::<Vec<_>>();
+        let mut seen: HashSet<_> = related.iter().map(|track| track.id.clone()).collect();
+        related.extend(similar.into_iter().map(|(_,track)| track).filter(|track| seen.insert(track.id.clone())));
+        (format!("Похожее на {name}"), smooth_order(related, &vectors, 30))
+    } else {
+        ("Похожее на любимого исполнителя".to_owned(), Vec::new())
+    };
+    result.push(json!({"id":"artist","title":artist_title,"description":"По вашему любимому исполнителю","tracks":artist_tracks}));
+    let mut style_weights = vec![0.0; taste.centroids.len()];
+    for (id, weight) in &taste.weights {
+        if *weight > 0.0 {
+            if let Some(index) = vectors.get(id).and_then(|v| nearest(v, &taste.centroids)) {
+                style_weights[index] += weight;
+            }
+        }
+    }
+    let style = style_weights.iter().enumerate().max_by(|a,b| f32::total_cmp(a.1,b.1)).map(|(index,_)| index);
+    let style_tracks = ranked.into_iter().filter(|track| style.is_some() &&
+        vectors.get(&track.id).and_then(|v| nearest(v, &taste.centroids)) == style).collect();
+    result.push(json!({"id":"style","title":"В вашем стиле","description":"По одному из ваших любимых звучаний",
+        "tracks":smooth_order(style_tracks, &vectors, 30)}));
+    Ok(Json(json!({"day":day,"week":week,"mixes":result})))
+}
+
+async fn weekly_tracks(
+    state: &AppState, user_id: i64, kind: &str, week: &str, title: &str, mut candidates: Vec<Track>,
+    catalog: &[Track], vectors: &HashMap<String, Vector>, taste: &Taste,
+) -> Result<Vec<Track>, ApiError> {
+    let cached: Option<String> = sqlx::query_scalar(
+        "SELECT track_ids_json FROM personal_mixes WHERE user_id=? AND kind=? AND period=?")
+        .bind(user_id).bind(kind).bind(week).fetch_optional(&state.db).await?;
+    if let Some(cached) = cached {
+        let ids = serde_json::from_str::<Vec<String>>(&cached).unwrap_or_default();
+        return Ok(materialize(&ids, catalog, &taste.blocked));
+    }
+    let previous: Option<String> = sqlx::query_scalar(
+        "SELECT track_ids_json FROM personal_mixes WHERE user_id=? AND kind=? AND period<? ORDER BY period DESC LIMIT 1")
+        .bind(user_id).bind(kind).bind(week).fetch_optional(&state.db).await?;
+    if let Some(previous) = previous {
+        let ids: HashSet<String> = serde_json::from_str(&previous).unwrap_or_default();
+        candidates.sort_by_key(|track| ids.contains(&track.id));
+    }
+    let ordered = smooth_order(candidates, vectors, 50);
+    if ordered.len() >= 25 && taste.personalized() {
+        let ids: Vec<_> = ordered.iter().map(|track| &track.id).collect();
+        let stored: String = sqlx::query_scalar(
+            "INSERT INTO personal_mixes(user_id,kind,period,title,track_ids_json) VALUES (?,?,?,?,?)
+             ON CONFLICT(user_id,kind,period) DO UPDATE SET title=personal_mixes.title RETURNING track_ids_json")
+            .bind(user_id).bind(kind).bind(week).bind(title).bind(serde_json::to_string(&ids).unwrap())
+            .fetch_one(&state.db).await?;
+        sqlx::query("DELETE FROM personal_mixes WHERE user_id=? AND period<date('now','-35 days')")
+            .bind(user_id).execute(&state.db).await?;
+        let ids = serde_json::from_str::<Vec<String>>(&stored).unwrap_or_default();
+        return Ok(materialize(&ids, catalog, &taste.blocked));
+    }
+    Ok(ordered)
+}
+
 pub async fn daily(State(state):State<AppState>,headers:HeaderMap)->Result<Json<Value>,ApiError>{
     bootstrap(&state,false).await;
     let _guard=state.recommendation_lock.lock().await;
@@ -429,7 +534,14 @@ pub async fn daily(State(state):State<AppState>,headers:HeaderMap)->Result<Json<
         let ids:Vec<String>=serde_json::from_str(row.get("track_ids_json")).unwrap_or_default();
         if row.get::<i64,_>("personalized")!=0||!taste.personalized(){return Ok(Json(json!({"tracks":materialize(&ids,&tracks,&taste.blocked),"day":day,"personalized":row.get::<i64,_>("personalized")!=0})));}
     }
-    let ranked=rank(&tracks,&taste,&vectors,&WaveState::default());let ordered=smooth_order(ranked,&vectors,50);
+    let previous:Option<String>=sqlx::query_scalar("SELECT track_ids_json FROM daily_mixes WHERE user_id=? AND day<? ORDER BY day DESC LIMIT 1")
+        .bind(uid).bind(&day).fetch_optional(&state.db).await?;
+    let mut ranked=rank(&tracks,&taste,&vectors,&WaveState::default());
+    if let Some(previous)=previous {
+        let previous:HashSet<String>=serde_json::from_str(&previous).unwrap_or_default();
+        ranked.sort_by_key(|track|previous.contains(&track.id));
+    }
+    let ordered=smooth_order(ranked,&vectors,50);
     // An empty catalog is transient; don't freeze an empty mix for a whole day.
     if ordered.len()==50{
         let ids:Vec<_>=ordered.iter().map(|t|&t.id).collect();sqlx::query("INSERT INTO daily_mixes(user_id,day,track_ids_json,personalized,algorithm_version) VALUES (?,?,?,?,2) ON CONFLICT(user_id,day) DO UPDATE SET track_ids_json=excluded.track_ids_json,personalized=excluded.personalized,algorithm_version=2").bind(uid).bind(&day).bind(serde_json::to_string(&ids).unwrap()).bind(taste.personalized()).execute(&state.db).await?;

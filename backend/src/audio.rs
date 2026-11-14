@@ -363,6 +363,9 @@ impl AudioService {
             sqlx::query("UPDATE audio_cache SET last_accessed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE track_id=?").bind(&t.id).execute(&self.db).await?;
             let response=ServeFile::new(path).oneshot(request).await.map_err(|_|media_error("cache read failed"))?;
             let (mut parts,body)=response.into_parts();parts.headers.insert(header::CONTENT_TYPE,mime.parse().map_err(|_|media_error("invalid audio type"))?);
+            if parts.status.is_success() {
+                parts.headers.insert("x-yamusic-mode", header::HeaderValue::from_static("full"));
+            }
             drop(io);
             let stream=Body::new(body).into_data_stream().map(move |chunk| { let _keep_alive=&guard; chunk });
             return Ok(Response::from_parts(parts,Body::from_stream(stream)));

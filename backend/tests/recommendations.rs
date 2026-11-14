@@ -44,6 +44,16 @@ async fn reactions_are_idempotent_profiles_are_isolated_and_wave_refills(){
     let daily:Value=client.get(format!("{url}/api/daily-mix")).header("X-YaMusic-Profile",a).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();let list=daily["tracks"].as_array().unwrap();assert_eq!(list.len(),50);for(i,t)in list.iter().enumerate(){assert!(!list[i.saturating_sub(3)..i].iter().any(|other|other["artist_id"]==t["artist_id"]));}
     let again:Value=client.get(format!("{url}/api/daily-mix")).header("X-YaMusic-Profile",a).send().await.unwrap().json().await.unwrap();assert_eq!(daily,again,"the complete daily mix stays fixed within the day");
     let data:Vec<(String,Vec<u8>)>=sqlx::query_as("SELECT id,embedding FROM tracks WHERE embedding IS NOT NULL").fetch_all(&db).await.unwrap();assert_eq!(data.len(),80);assert!(data.iter().all(|(_,v)|v.len()==2048));
+    let personalized:Value=client.get(format!("{url}/api/mixes")).header("X-YaMusic-Profile",a)
+        .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    let playlists=personalized["mixes"].as_array().unwrap();
+    let kinds:Vec<_>=playlists.iter().map(|playlist|playlist["id"].as_str().unwrap()).collect();
+    assert_eq!(kinds,["daily","weekly","discovery","artist","style"]);
+    assert_eq!(playlists[0]["tracks"],daily["tracks"]);
+    for playlist in playlists {
+        assert!(playlist["tracks"].as_array().unwrap().iter().all(|track| track["id"]!="deezer_5"));
+    }
+    assert!(playlists[2]["tracks"].as_array().unwrap().iter().all(|track| track["id"]!="deezer_1"&&track["id"]!="deezer_2"));
     task.abort();catalog_task.abort();db.close().await;
 }
 

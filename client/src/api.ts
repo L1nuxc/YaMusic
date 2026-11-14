@@ -1,5 +1,6 @@
 import type { Track, SearchResults, Album, Artist, TranslationProvider } from './types.ts';
 import type { LyricsResult } from './lyrics.ts';
+import type { LivePlayback } from './player.ts';
 
 async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
   const response = await fetch(`/api${path}`, { signal, headers: { Accept: 'application/json', 'X-YaMusic-Profile': profileId } });
@@ -25,7 +26,15 @@ export interface AuthConfig {enabled:boolean;bot_username?:string|null;spotify?:
 export interface MissingTrack { artist:string; title:string }
 export interface ImportPreview {title:string;tracks:Track[];checked:number;total:number;limited?:boolean;missing?:MissingTrack[];unavailable?:number}
 export interface TelegramLogin {id:number;first_name:string;last_name?:string;username?:string;photo_url?:string;auth_date:number;hash:string}
-export interface DailyMix {tracks:Track[];day:string;personalized:boolean}
+export interface PersonalMix {id:string;title:string;description:string;tracks:Track[]}
+export interface Mixes {day:string;week:string;mixes:PersonalMix[]}
+export interface AccountLibrary {entries:Record<string, unknown>;likes:Track[];dislikes:string[]}
+export interface LibraryChange {id:string;entries:Record<string, unknown>;import_legacy?:boolean;likes?:string[]}
+export interface DeviceCommand {action:string;value?:number}
+export interface DeviceState {
+  active:string|null; devices:Record<string,{label:string}>; playback:LivePlayback|null;
+  revision:number; age:number; transferring:boolean; commands:DeviceCommand[];
+}
 export interface RecommendationStatus {available:boolean;analyzed_tracks:number;pending:number;analyzing:boolean;likes:string[];dislikes:string[];blocked_tracks:Track[]}
 export interface Reaction {track_id:string;action:'like'|'unlike'|'dislike'|'undislike'|'complete'|'early_skip';event_id:string;listen_ratio?:number;listened_sec?:number;session_id?:string}
 export interface ResumeSnapshot { track: Track; position: number; context?: string | null; queue: Track[]; captured_at: number }
@@ -69,7 +78,13 @@ export const api = {
   recommendationStatus:()=>get<RecommendationStatus>('/recommendations/status'),
   wave:()=>post<WaveQueue>('/wave',{}),
   advanceWave:(session:string,current_id:string)=>post<WaveQueue>(`/wave/${encodeURIComponent(session)}/next`,{current_id}),
-  dailyMix:()=>get<DailyMix>('/daily-mix'),
+  mixes:()=>get<Mixes>('/mixes'),
+  accountLibrary:()=>get<AccountLibrary>('/account/library'),
+  saveAccountLibrary:async (change:LibraryChange)=>{
+    const path='/account/library';
+    const response=await fetch('/api'+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(change)});
+    if(!response.ok)throw apiError(response,path,'Не удалось синхронизировать медиатеку.');
+  },
   prepare: (tracks: Track[], playback = false) => {
     const now=Date.now();for(const [id,at] of prepared)if(now-at>60000)prepared.delete(id);
     const ids=tracks.slice(0,5).map(t=>t.id).filter(id=>now-(prepared.get(`${playback}:${id}`)??0)>(playback?6000:60000));
@@ -83,6 +98,12 @@ export const api = {
   album: (id: number) => get<{ album: Album; tracks: Track[] }>(`/albums/${id}`),
   artist: (id: number) => get<{ artist: Artist; tracks: Track[]; albums: Album[] }>(`/artists/${id}`),
   restorePlayback: () => get<ResumeSnapshot | null>('/playback/resume'),
+  devices: (body:object, keepalive=false) => fetch('/api/playback/devices',{
+    method:'POST',keepalive,headers:{'Content-Type':'application/json'},body:JSON.stringify(body)
+  }).then(async response=>{
+    if(!response.ok)throw apiError(response,'/playback/devices','Устройства пока недоступны.');
+    return await response.json() as DeviceState;
+  }),
   savePlayback: async (snapshot: ResumeSnapshot) => {
     const path='/playback/resume';
     const response=await fetch('/api'+path,{method:'POST',keepalive:true,headers:{'Content-Type':'application/json'},
@@ -97,7 +118,6 @@ export const api = {
   spotifyPlaylists:(offset:number,signal?:AbortSignal)=>get<{connected:boolean;playlists:{id:string;name:string}[];next_offset?:number}>(`/import/spotify/playlists?offset=${offset}`,signal),
   spotifyPage:(playlist:string,offset:number,signal?:AbortSignal)=>post<Omit<ImportPreview,'title'>&{next_offset?:number}>('/import/spotify/page',{playlist,offset},signal),
   importPreview: (input: string, signal?: AbortSignal) => post<ImportPreview>('/import/preview',{input},signal),
-  neuroWave: (query: string, signal?: AbortSignal) => post<{tracks:Track[];reference?:string}>('/neuro-wave',{query},signal),
   translateLyrics: (id: string, provider: TranslationProvider, language: string, signal?: AbortSignal) =>
     post<{translated_lrc:string;plain?:boolean}>(`/lyrics/${encodeURIComponent(id)}/translation?${new URLSearchParams({provider,lang:language})}`,{},signal),
   lyrics: (id: string, signal?: AbortSignal) => get<LyricsResult>(`/lyrics/${encodeURIComponent(id)}`,signal),

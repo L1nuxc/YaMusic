@@ -9,6 +9,8 @@ use tower_http::{services::{ServeDir, ServeFile}, trace::TraceLayer};
 pub mod lyrics;
 mod llm;
 mod playback_resume;
+mod account_library;
+mod devices;
 mod smart_search;
 mod music_import;
 mod spotify;
@@ -35,6 +37,7 @@ pub struct AppState {
     pub analysis: Arc<analysis::Analyzer>,
     pub recommendation_lock: Arc<Mutex<()>>,
     pub expansions: Arc<Mutex<HashMap<i64,Instant>>>,
+    devices: Arc<Mutex<HashMap<i64,devices::AccountDevices>>>,
 }
 
 impl AppState {
@@ -55,6 +58,7 @@ impl AppState {
             analysis,
             recommendation_lock: Arc::new(Mutex::new(())),
             expansions: Arc::new(Mutex::new(HashMap::new())),
+            devices: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -93,7 +97,6 @@ pub fn app(state: AppState, dist: PathBuf) -> Router {
     let protected = Router::new()
         .route("/search", get(search))
         .route("/search/smart", post(smart_search::search))
-        .route("/neuro-wave", post(smart_search::neuro_wave))
         .route("/import/spotify/start",post(spotify::start))
         .route("/import/spotify/playlists",get(spotify::playlists))
         .route("/import/spotify/page",post(spotify::page))
@@ -101,6 +104,8 @@ pub fn app(state: AppState, dist: PathBuf) -> Router {
         .route("/import/match",post(music_import::match_export).layer(DefaultBodyLimit::max(65536)))
         .route("/import/preview", post(music_import::preview).layer(DefaultBodyLimit::max(65536)))
         .route("/playback/resume", get(playback_resume::load).post(playback_resume::save))
+        .route("/playback/devices", post(devices::sync).layer(DefaultBodyLimit::max(768 * 1024)))
+        .route("/account/library", get(account_library::load).post(account_library::save).layer(DefaultBodyLimit::max(24 * 1024 * 1024)))
         .route("/discover", get(discover))
         .route("/tracks/{id}", get(track))
         .route("/albums/{id}", get(album))
@@ -119,6 +124,7 @@ pub fn app(state: AppState, dist: PathBuf) -> Router {
         .route("/wave", post(recommendations::start_wave))
         .route("/wave/{id}/next", post(recommendations::next_wave))
         .route("/daily-mix", get(recommendations::daily))
+        .route("/mixes", get(recommendations::mixes))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), auth::require_session));
     let api = Router::new()
         .route("/health", get(health))

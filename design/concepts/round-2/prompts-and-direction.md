@@ -28,7 +28,7 @@ Image 4 (04 Mono Editorial): use ONLY its calm neutral black/charcoal/gray/white
 
 CRITICAL USER CHANGES:
 Absolutely NO theme toggles anywhere on either home screen: no sun/moon icons, no light/dark switch. Theme control lives only inside settings, which are not shown. A subtle gear/profile access is okay.
-Phone must be uncluttered and have VERY LITTLE text: main "Моя волна", no explanatory paragraphs, daily mix covers with very short titles, "Нейро-волна" with just "Опишите настроение..." in its field. Keep the desktop "Далее в волне" queue but do not squeeze it onto the phone.
+Phone must be uncluttered and have VERY LITTLE text: main "Моя волна", no explanatory paragraphs, daily mix covers with very short titles. Keep the desktop "Далее в волне" queue but do not squeeze it onto the phone.
 Phone MINI PLAYER must be compact and tidy: small square artwork, one short track title and small artist line, heart, pause, next; a hairline progress indicator along the bottom edge, no large draggable slider, no timer clutter. Mini player sits ABOVE and separate from bottom navigation with a small gap, no overlaps, safe bottom inset.
 Maintain unified elegant rounded outline icons, identical stroke width, white/soft-gray text, high contrast and correct Russian labels. Album art may have quiet restrained colors but UI stays monochrome. Glass selective, not a bright border around everything. Beautiful spacing and optical alignment. No marketing paragraphs, no watermarks. Do not show other pages or extra devices. Only a short variant heading above the board. Static visual mockup, not code.
 

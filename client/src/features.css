@@ -251,8 +251,6 @@ button.compact-track:hover:not(:disabled),.compact-track.current { background:va
 .login-card .account-login-status:empty { display:none; }
 .login-card .secondary-button { margin:13px auto 0; }
 .library-settings,[data-expanded-queue],.player-track-name > .mobile-track-artist { display:none; }
-.neuro-banner:has(.neuro-status) { flex-wrap:wrap; }
-.neuro-status { flex-basis:100%; color:var(--muted); font-size:12px; margin-top:7px; }
 .player-name-link { text-align:left; padding:0; }
 .player-bar.has-track { cursor:pointer; }
 :where(.queue-panel-list,.playlist-menu-list,.song-actions,.playlist-discovery-columns [data-playlist-likes],.playlist-discovery-columns [data-playlist-suggestions]) {
@@ -310,3 +308,17 @@ dialog { scrollbar-width:thin;scrollbar-color:var(--line) transparent;overscroll
 #telegram-login-widget { min-height: 44px; margin: 24px auto 12px; max-width: 100%; overflow: hidden; }
 .account-dialog .account-login-status { color: var(--muted); margin: 8px auto; }
 .account-dialog .account-local-note { margin-top: 24px; color: var(--muted); }
+.device-list { display: grid; gap: 8px; }
+.device-option { width: 100%; justify-content: flex-start; }
+.device-option small { margin-inline-start: auto; color: var(--muted); }
+.device-status,.mobile-device-status { color: var(--muted); font-size: 11px; }
+.device-status { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 125px; }
+.mobile-device-status { display: none; }
+.desktop-update { position: fixed; z-index: 10; right: 18px; bottom: calc(var(--player-height) + 28px); display: flex; align-items: center; gap: 10px; padding: 12px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); color: var(--text); box-shadow: 0 8px 24px #0004; }
+.download-folder { overflow-wrap: anywhere; color: var(--muted); }
+.download-row { display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: center; }
+.offline-desktop .sidebar,.offline-desktop .mobile-navigation,.offline-desktop [data-action="devices"],.offline-desktop [data-action="track-menu"],.offline-desktop [data-action="like"],.offline-desktop [data-action="like-current"],.offline-desktop [data-action="add-playlist-menu"] { display: none !important; }
+.offline-desktop .workspace { margin-left: 0; }
+@media (max-width:760px) {
+  .mobile-device-status:not(:empty) { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+}
