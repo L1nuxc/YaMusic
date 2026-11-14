@@ -18,7 +18,7 @@ import { mountPillGroups, selectPillButton, syncTabPill } from './tab-pill.ts';
 import { mountPlayerRanges, playerRange, showCurrentVolume } from './player-range.ts';
 import { mountCoverParallax } from './cover-parallax.ts';
 import { mountSidebar } from './sidebar.ts';
-import { animateDeck, animateLyric, animatePlayerButton, scrollToLyric, stopLyricsScroll } from './player-motion.ts';
+import { animateDeck, animateLyricEcho, animatePlayerButton, scrollToLyric, stopLyricsScroll } from './player-motion.ts';
 import { interfaceMotion } from './springs.ts';
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
@@ -1154,6 +1154,7 @@ async function loadLyrics(): Promise<void> {
   const t=player.current, container=dialog.querySelector<HTMLElement>('.lyrics-scroll');
   if(!t || !container || !dialog.open) return;
   lyricsRequest?.abort(); const controller=new AbortController(); lyricsRequest=controller;
+  stopLyricsScroll(container);
   container.innerHTML=loading(); lyricLines=[]; plainLyricLines=[]; activeLyric=-1;
   try {
     const data=await retryLyrics(() => api.lyrics(t.id,controller.signal),controller.signal);
@@ -1166,7 +1167,7 @@ async function loadLyrics(): Promise<void> {
     followControl.querySelector('.lyrics-tooltip')!.textContent=isPlain?'Текст без синхронизации':'К текущей строке';
     if(isPlain)followControl.setAttribute('aria-label','Текст без синхронизации');
     if(data.instrumental) container.innerHTML=empty('Только музыка','У этой композиции нет слов.','audio-lines');
-    else if(lyricLines.length) container.innerHTML=lyricLines.map((line,i)=>`<button class="lyric-line" data-action="seek-lyric" data-time="${line.time}" data-line="${i}" aria-label="${e(line.text)}, ${formatTime(line.time)}">${e(line.text)}</button>`).join('');
+    else if(lyricLines.length) container.innerHTML=lyricLines.map((line,i)=>`<button class="lyric-line" data-action="seek-lyric" data-time="${line.time}" data-line="${i}" aria-label="${e(line.text)}, ${formatTime(line.time)}"><span class="lyric-text">${e(line.text)}</span></button>`).join('');
     else if(isPlain) container.innerHTML=`<div class="plain-lyrics">${plainLyricLines.map((line,i)=>`<p data-plain-line="${i}">${e(line)||'&nbsp;'}</p>`).join('')}</div>`;
     else container.innerHTML=empty('Текст пока не найден','В LRCLIB пока нет текста именно этой версии песни.','mic-2');
     const translate=dialog.querySelector<HTMLButtonElement>('[data-action="translation"]');
@@ -1277,6 +1278,7 @@ function updateLyrics(animate = true): void {
   dialog.querySelectorAll<HTMLButtonElement>('.lyric-line').forEach(line=>{line.disabled=!synchronized;});
   const index=synchronized?activeLine(lyricLines,player.time):-1;
   if(index===activeLyric) return;
+  const previous = activeLyric;
   activeLyric=index;
   dialog.querySelectorAll<HTMLElement>('[data-line]').forEach(line=>{
     const position = Number(line.dataset.line);
@@ -1287,7 +1289,10 @@ function updateLyrics(animate = true): void {
     if(active) line.setAttribute('aria-current','true'); else line.removeAttribute('aria-current');
   });
   const current=dialog.querySelector<HTMLElement>(`[data-line="${index}"]`), scroll=dialog.querySelector<HTMLElement>('.lyrics-scroll');
-  if (current && animate) animateLyric(current);
+  if (current && animate && index === previous + 1 && previous >= 0) {
+    const departing = scroll?.querySelector<HTMLElement>(`[data-line="${previous}"]`);
+    if (departing) animateLyricEcho(departing);
+  }
   if(current && scroll && scroll.clientHeight>0 && followLyrics) {
     scrollToLyric(scroll, current);
   }
@@ -1543,7 +1548,7 @@ document.addEventListener('click', async event => {
   const target = clicked.closest<HTMLElement>('[data-action]');
   if (!target) { if(clicked.closest('#song-actions a')) queueMicrotask(()=>closeSongActions(true)); return; }
   const action = target.dataset.action, id = target.dataset.id || '';
-  if (target.matches('.transport-buttons button, .hero-controls button, [data-mobile-play], .player-extras button, .expanded-actions button, .mute-button, .lyrics-tabs button')) {
+  if (target.matches('.transport-buttons button, .hero-controls button, [data-mobile-play], .player-extras button, .expanded-actions button, .mute-button')) {
     const controls = target.closest('.player-bar, .full-player-dialog');
     queueMicrotask(() => {
       const button = target.isConnected ? target : controls?.querySelector<HTMLElement>(`button[data-action="${action}"]`);
