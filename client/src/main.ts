@@ -65,6 +65,7 @@ let searchHistory=restoreSearchHistory(localStorage.getItem(SEARCH_HISTORY_KEY))
 let searchHistoryTimer=0;
 let searchRequest: AbortController | undefined;
 let searchTimer = 0;
+let detailRequest: AbortController | undefined;
 let toastTimer = 0;
 let lastVolume = library.settings.volume || .65;
 let lyricsRequest: AbortController | undefined;
@@ -627,12 +628,13 @@ async function runSearch(): Promise<void> {
     }
     if (gen !== generation || controller.signal.aborted) return;
     searchResults = result;
-    visibleTracks = result.tracks;
+    visibleTracks = register(result.tracks);
     drawSearchResults();
     searchHistoryTimer = window.setTimeout(rememberCurrentSearch, 1500);
   } catch (error) {
     if (gen !== generation || controller.signal.aborted) return;
     container.innerHTML = errorState(error);
+    hydrateSavedCredits(result.tracks.slice(0, 24));
     hydrateIcons(main);
   }
 }
@@ -725,6 +727,8 @@ async function detail(kind: string, id: string, gen: number): Promise<void> {
     if (kind === 'daily') {
       const data=personalMixes??await getMixes();
       if(gen!==generation)return;
+  const controller = new AbortController();
+  detailRequest = controller;
       const mix=data.mixes.find(item=>item.id===(id||'daily'));
       if(!mix){main.innerHTML=empty('Подборка не найдена','','list-music');return;}
       visibleTracks=mix.tracks;
@@ -764,19 +768,36 @@ async function detail(kind: string, id: string, gen: number): Promise<void> {
       visibleTracks = register(data.tracks);
       main.innerHTML = `<div class="collection-header"><div class="collection-art mood-art ${mood.art}">${data.tracks[0]?image(data.tracks[0].cover_url):icon('waves')}</div><div><span class="eyebrow">СМЕНА НАСТРОЕНИЯ</span><h1>${e(mood.title)}</h1><p>Знакомство с музыкой · ${e(mood.query)}</p><button class="primary-button" data-action="play-list">${icon('play')}Слушать</button></div></div>${rows(data.tracks)}`;
     } else if (kind === 'album') {
-      const data = await api.album(Number(id)); if (gen !== generation) return;
+      const data = await api.album(Number(id), controller.signal); if (gen !== generation) return;
       visibleTracks = register(data.tracks);
       main.innerHTML = `<div class="collection-header"><div class="collection-art">${image(data.album.cover_url)}</div><div><span class="eyebrow">АЛЬБОМ</span><h1>${e(data.album.title)}</h1><button class="artist-link" data-action="artist" data-id="${data.album.artist_id}">${e(data.album.artist)} ${icon('arrow-up-right')}</button><p>${trackCount(data.tracks.length)} · Deezer</p><button class="primary-button" data-action="play-list" ${data.tracks.length ? '' : 'disabled'}>${icon('play')}Слушать</button></div></div>${rows(data.tracks)}`;
     } else {
-      const data = await api.artist(Number(id)); if (gen !== generation) return;
+      const data = await api.artist(Number(id), controller.signal); if (gen !== generation) return;
       refreshSearchArtist(authUser?.id, data.artist);
       visibleTracks = register(data.tracks);
+      hydrateSavedCredits(data.tracks.slice(0, 30));
       main.innerHTML = `<div class="collection-header artist-header"><div class="collection-art">${image(data.artist.picture_url)}</div><div><span class="eyebrow">ИСПОЛНИТЕЛЬ</span><h1>${e(data.artist.name)}</h1><div class="collection-actions"><button class="primary-button" data-action="play-list" ${data.tracks.length ? '' : 'disabled'}>${icon('play')}Слушать</button><button class="secondary-button" data-action="artist-follow" data-id="${data.artist.id}" aria-pressed="false" disabled>Подписаться</button></div></div></div><section class="section">${sectionHeading('Треки')}${rows(data.tracks, 30)}</section><section class="section">${sectionHeading('Альбомы')}<div class="card-grid">${data.albums.map(albumCard).join('')}</div></section>`;
       const follow=main.querySelector<HTMLButtonElement>('[data-action="artist-follow"]')!;
       void authReady.then(()=>api.favoriteArtists()).then(({artists})=>{if(follow.isConnected)setFollowButton(follow,artists.some(a=>a.id===data.artist.id));}).catch(()=>{if(follow.isConnected)follow.disabled=false;});
     }
     if (gen === generation) hydrateIcons(main);
   } catch (error) { if (gen === generation) { main.innerHTML = errorState(error); hydrateIcons(main); } }
+      if (data.more_tracks) {
+        const section = follow.closest('.artist-header')?.nextElementSibling;
+        if (section && !data.tracks.length) section.insertAdjacentHTML('beforeend', loading());
+        void api.artist(Number(id), controller.signal, false).then(full => {
+          if (gen !== generation || controller.signal.aborted || !(section instanceof HTMLElement) || !section.isConnected) return;
+          visibleTracks = register(full.tracks);
+          const play = main.querySelector<HTMLButtonElement>('[data-action="play-list"]');
+          if (play) play.disabled = !full.tracks.length;
+          section.innerHTML = sectionHeading('Треки') + rows(full.tracks, 30);
+          hydrateIcons(section);
+          updatePlayerControls();
+        }).catch(() => {
+          if (gen === generation && !controller.signal.aborted) section?.querySelector('.loading-state')?.remove();
+        });
+      } else hydrateSavedCredits(data.tracks);
+
 }
 
 function navigate(): void {
@@ -785,7 +806,7 @@ function navigate(): void {
   closePlaylistMenu();closeSongActions();currentPlaylist=undefined;playlistSuggestions=[];
   if(currentView==='search'&&searchResults)rememberCurrentSearch();
   clearTimeout(searchHistoryTimer);
-  generation++; searchRequest?.abort(); clearTimeout(searchTimer); wave?.destroy(); wave = undefined;
+  generation++; detailRequest?.abort(); searchRequest?.abort(); clearTimeout(searchTimer); wave?.destroy(); wave = undefined;
   const parts = location.hash.replace(/^#\/?/, '').split('/');
   const page = parts[0] || 'home';
   currentView = page;
@@ -882,8 +903,8 @@ function updatePlayerControls(): void {
   const t = player.current;
   const glyph = player.playing ? 'pause' : 'play';
   document.querySelectorAll<HTMLElement>('[data-playback-label]').forEach(el=>{
-    const loading = player.mode === 'loading';
-    const message = loading ? 'Находим аудио…' : player.mode === 'unavailable' ? 'Трек недоступен · попробуйте ещё раз' : '';
+    const loading = player.mode === 'loading' || player.seekingForPlayback;
+    const message = player.seekingForPlayback ? 'Перематываем…' : loading ? 'Находим аудио…' : player.mode === 'unavailable' ? 'Трек недоступен · попробуйте ещё раз' : '';
     el.parentElement!.classList.toggle('loading-audio', loading);
     if (el.textContent !== message) el.textContent = message;
   });
@@ -918,11 +939,29 @@ function fillRange(el: HTMLInputElement): void {
   el.style.setProperty('--range-fill', `${fill}%`);
   el.setAttribute('aria-valuetext', el.hasAttribute('data-volume') ? `${Math.round(Number(el.value) * 100)}%` : formatTime(Number(el.value)));
 }
+function updateBufferProgress(): void {
+  const buffered = player.mirroring ? undefined : player.audio.buffered;
+  const duration = player.duration;
+  const stops = ['var(--range-track) 0%'];
+  if (buffered && duration > 0) {
+    for (let index = 0; index < buffered.length; index++) {
+      const start = Math.min(100, buffered.start(index) / duration * 100);
+      const end = Math.min(100, buffered.end(index) / duration * 100);
+      stops.push(`var(--range-track) ${start}%, var(--range-buffer) ${start}% ${end}%, var(--range-track) ${end}%`);
+    }
+  }
+  stops.push('var(--range-track) 100%');
+  const layer = `linear-gradient(to right, ${stops.join(', ')})`;
+  for (const input of document.querySelectorAll<HTMLInputElement>('[data-seek]')) {
+    if (input.style.getPropertyValue('--range-buffer-background') !== layer) input.style.setProperty('--range-buffer-background', layer);
+  }
+}
 function updateProgress(): void {
   updateLyrics();
+  updateBufferProgress();
   document.querySelectorAll<HTMLInputElement>('[data-seek]').forEach(el => {
     el.max = String(player.duration);
-    el.value = String(player.time);
+    if (!el.matches(':active')) el.value = String(player.seekPosition);
     fillRange(el);
   });
   document.querySelectorAll('[data-elapsed]').forEach(el => el.textContent = formatTime(player.time));
@@ -2115,7 +2154,7 @@ document.addEventListener('input', event => {
     save();
   }
   else if (input.matches('[data-volume]')) { player.setVolume(Number(input.value)); if(!player.mirroring){library.settings.volume = player.volume;save();} fillRange(input); showCurrentVolume(input); }
-  else if (input.matches('[data-seek]')) { player.seek(Number(input.value)); fillRange(input); }
+  else if (input.matches('[data-seek]')) { fillRange(input); }
   else if (input.id === 'search-input') {
     clearTimeout(searchTimer); clearTimeout(searchHistoryTimer); searchRequest?.abort();
     if (searchResults && searchQuery !== input.value.trim()) rememberCurrentSearch();
@@ -2125,7 +2164,7 @@ document.addEventListener('input', event => {
     } else {
       const results = main.querySelector<HTMLElement>('#search-results')!;
       results.inert = true;
-      searchTimer = window.setTimeout(() => void runSearch(), 450);
+      searchTimer = window.setTimeout(() => void runSearch(), 260);
     }
   }
   else if (input.id === 'playlist-description') resizePlaylistDescription(input as unknown as HTMLTextAreaElement);
@@ -2284,7 +2323,12 @@ mobileNav.addEventListener('pointerup',event=> {
 });
 mobileNav.addEventListener('click',event=> { if(Date.now()<suppressNavClickUntil) { event.preventDefault(); event.stopPropagation(); } },true);
 mobileNav.addEventListener('pointercancel',()=> { navPointer=undefined; mobileNav.classList.remove('dragging'); });
+document.addEventListener('change', event => {
+  const input = event.target;
+  if (input instanceof HTMLInputElement && input.matches('[data-seek]')) player.seek(input.valueAsNumber);
+});
 player.addEventListener('change',updatePlayerControls);
+player.addEventListener('bufferprogress',updateBufferProgress);
 player.addEventListener('tick',()=>{
   updateProgress();
   if(player.playing&&!player.mirroring)void persistPlayback();
@@ -2335,10 +2379,7 @@ player.addEventListener('reaction',event=>{
 player.addEventListener('trackchange',event=> {
   const track=(event as CustomEvent<Track>).detail;
   renderPlayer();
-  void api.track(track.id).then(full=>{
-    applyTrackMetadata(full);save();
-    if(player.current?.id===full.id)renderPlayer();
-  }).catch(()=>{});
+  if (!localDesktop) hydrateSavedCredits([track]);
   if(!restoringPlayback)void persistPlayback(true,player.mode==='full'?player.time:0);
   api.prepare(player.queue.slice(player.index+(restoringPlayback?0:1),player.index+6),true);
   if(player.context&&!restoringPlayback)refreshWave();
@@ -2357,14 +2398,13 @@ player.addEventListener('playing',()=>{
 });
 player.addEventListener('playererror',event=>{
   const current=player.current;
-  if(player.context&&current&&player.mode==='unavailable'&&!failedWaveTracks.has(current.id)&&failedWaveTracks.size<5){
+  if(player.context&&current&&player.mode==='unavailable'&&!failedWaveTracks.has(current.id)){
     failedWaveTracks.add(current.id);
     player.next(false,false);
     return;
   }
   toast((event as CustomEvent<string>).detail);
 });
-player.addEventListener('playing',()=>failedWaveTracks.clear());
 player.addEventListener('playbacknotice',event=>toast((event as CustomEvent<string>).detail));
 window.addEventListener('hashchange',()=>{if(localDesktop)downloadsView();else navigate();});
 window.addEventListener('yamusic-session-expired',()=>{

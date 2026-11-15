@@ -94,9 +94,9 @@ export const api = {
   },
   discover: () => get<{ tracks: Track[] }>('/discover'),
   track:(id:string)=>get<Track>(`/tracks/${encodeURIComponent(id)}`),
-  search: (q: string, kind = 'all', index = 0, signal?: AbortSignal) => get<SearchResults>(`/search?${new URLSearchParams({ q, type: kind, limit: '24', index: String(index) })}`, signal),
-  album: (id: number) => get<{ album: Album; tracks: Track[] }>(`/albums/${id}`),
-  artist: (id: number) => get<{ artist: Artist; tracks: Track[]; albums: Album[] }>(`/artists/${id}`),
+  search: (q: string, kind = 'all', index = 0, signal?: AbortSignal) => get<SearchResults>(`/search?${new URLSearchParams({ q, type: kind, limit: '24', index: String(index), compact: 'true' })}`, signal),
+  album: (id: number, signal?: AbortSignal) => get<{ album: Album; tracks: Track[] }>(`/albums/${id}?compact=true`, signal),
+  artist: (id: number, signal?: AbortSignal, compact = true) => get<{ artist: Artist; tracks: Track[]; albums: Album[]; more_tracks?: boolean }>(`/artists/${id}?compact=${compact}`, signal),
   restorePlayback: () => get<ResumeSnapshot | null>('/playback/resume'),
   devices: (body:object, keepalive=false) => fetch('/api/playback/devices',{
     method:'POST',keepalive,headers:{'Content-Type':'application/json'},body:JSON.stringify(body)

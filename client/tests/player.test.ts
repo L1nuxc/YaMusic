@@ -28,8 +28,27 @@ test('player renews a failed stream once, restores position and resets retries f
     const p = new Player(1);
     let errors = 0; p.addEventListener('playererror',()=>errors++);
     p.play(track);
-    assert.equal(p.audio.src,'/api/stream/deezer_42');
+    assert.match(p.audio.src,/^\/api\/stream\/deezer_42\?buffer=[a-f0-9-]{36}$/);
+    p.audio.duration = 10;
+    p.audio.dispatchEvent(new Event('durationchange'));
+    assert.equal(p.duration, 200, 'a fragment must not shrink the full timeline');
+    p.audio.duration = 200;
     assert.deepEqual(requests,[], 'playback must not start a second resolver request');
+    const token = p.audio.src.split('buffer=')[1];
+    const originalPerformance = globalThis.performance;
+    let clock = originalPerformance.now();
+    Object.defineProperty(globalThis, 'performance', { configurable: true, value: { now: () => clock } });
+    try {
+      for (let second = 1; second <= 30; second++) {
+        clock += 1000;
+        p.audio.currentTime = second;
+        p.audio.dispatchEvent(new Event('timeupdate'));
+        if (second < 30) assert.deepEqual(requests, []);
+      }
+      assert.deepEqual(requests, [`/api/stream/deezer_42/continue?buffer=${token}`]);
+    } finally {
+      Object.defineProperty(globalThis, 'performance', { configurable: true, value: originalPerformance });
+    }
     p.audio.currentTime = 32;
     p.audio.dispatchEvent(new Event('error'));
     assert.equal(p.audio.src,'/api/stream/deezer_42?refresh=1');
@@ -43,7 +62,7 @@ test('player renews a failed stream once, restores position and resets retries f
     p.audio.currentTime = 0;
     p.audio.dispatchEvent(new Event('error'));
     assert.equal(p.mode,'unavailable');
-    assert.equal(p.audio.src,'/api/stream/deezer_43', 'an unavailable initial source must not cause another long search automatically');
+    assert.match(p.audio.src,/^\/api\/stream\/deezer_43\?buffer=[a-f0-9-]{36}$/ , 'an unavailable initial source must not cause another long search automatically');
     p.resume();
     p.audio.currentTime = 1;
     p.audio.dispatchEvent(new Event('error'));
