@@ -68,6 +68,7 @@ pub struct AudioService {
     prefetch: Arc<PrefetchQueue>,
     youtube_blocked_until: Mutex<Option<Instant>>,
     buffers: StdMutex<HashMap<(String, String), BufferGate>>,
+    unavailable: StdMutex<HashMap<String, Instant>>,
 }
 #[derive(Default)]
 struct PrefetchQueue {
@@ -107,6 +108,7 @@ impl AudioService {
             prefetch: prefetch.clone(),
             youtube_blocked_until: Mutex::new(None),
             buffers: StdMutex::new(HashMap::new()),
+            unavailable: StdMutex::new(HashMap::new()),
         });
         for _ in 0..background_workers {
             let weak = Arc::downgrade(&service);
@@ -135,7 +137,7 @@ impl AudioService {
                     let _running = QueuedGuard { queue: queue.clone(), id: id.clone() };
                     let Ok(Some(track)) = sqlx::query_as::<_, Track>("SELECT * FROM tracks WHERE id=?")
                         .bind(&id).fetch_optional(&service.db).await else { continue; };
-                    if service.cached(&id).await.ok().flatten().is_none() {
+                    if !service.is_recently_unavailable(&id) && service.cached(&id).await.ok().flatten().is_none() {
                         if let Ok(Some(candidate)) = service.resolve_priority(&track, true).await {
                             let _ = service.warm_start(&track, &candidate).await;
                         }
@@ -230,6 +232,14 @@ impl AudioService {
         let token = request.uri().query()?.split('&').find_map(|part| part.strip_prefix("buffer="))?;
         self.buffer_gate(id, token, false)
     }
+    pub fn unavailable_tracks(&self) -> HashSet<String> {
+        let mut unavailable = self.unavailable.lock().unwrap();
+        unavailable.retain(|_, at| at.elapsed() < Duration::from_secs(90));
+        unavailable.keys().cloned().collect()
+    }
+    fn is_recently_unavailable(&self, id: &str) -> bool {
+        self.unavailable.lock().unwrap().get(id).is_some_and(|at| at.elapsed() < Duration::from_secs(90))
+    }
     pub fn has_foreground_work(&self)->bool {self.foreground.load(Ordering::Relaxed)>0}
     pub async fn resolve(&self,t:&Track)->Result<Option<Candidate>,ApiError> {self.resolve_priority(t,false).await}
     async fn resolve_priority(&self,t:&Track,background:bool)->Result<Option<Candidate>,ApiError> {
@@ -282,7 +292,14 @@ impl AudioService {
             sqlx::query("INSERT INTO audio_resolutions (track_id,candidate_json,source_url,expires_at) VALUES (?,?,?,?) ON CONFLICT(track_id) DO UPDATE SET candidate_json=excluded.candidate_json,source_url=excluded.source_url,expires_at=excluded.expires_at,updated_at=CURRENT_TIMESTAMP")
                 .bind(&t.id).bind(value.to_string()).bind(&c.page_url).bind(expires as i64).execute(&self.db).await?;
         }
-        if completed && best.is_some() { self.remember(&t.id,best.clone()).await; }
+        if best.is_some() {
+            self.unavailable.lock().unwrap().remove(&t.id);
+            self.remember(&t.id, best.clone()).await;
+        } else if completed {
+            let mut unavailable = self.unavailable.lock().unwrap();
+            unavailable.retain(|_, at| at.elapsed() < Duration::from_secs(90));
+            if unavailable.len() < 1024 { unavailable.insert(t.id.clone(), Instant::now()); }
+        }
         Ok(best)
     }
     async fn wait_prepared(&self,id:&str)->Candidate {
@@ -301,24 +318,17 @@ impl AudioService {
         map.insert(id.into(),(Instant::now(),result));
     }
     async fn lookup(&self,source:&str,query:&str,t:&Track,background:bool)->Result<Option<Candidate>,()> {
-        if source=="soundcloud" {
-            // SoundCloud can return the top match and its stream together. The
-            // common path needs one extractor process instead of search+enrich.
-            let target=format!("scsearch1:{query}");
-            if let Ok(data)=self.run(&["-f",SOUNDCLOUD_FORMAT,"--dump-single-json",&target],background).await {
-                let value=data["entries"].as_array().and_then(|v|v.first()).unwrap_or(&data);
-                if let Some(c)=candidate(value,source,t) {
-                    if let Ok(Some(c))=self.ready(c,value,t,background).await{return Ok(Some(c));}
-                }
-            }
-        }
-        // Filter cheap search metadata before extracting any media. A blocked or
-        // mismatched first hit must not consume the entire playback deadline.
-        let target=format!("{}6:{query}",if source=="youtube"{"ytsearch"}else{"scsearch"});
+        // Search once for metadata. Trying the first entry with full extraction
+        // before searching again repeats the slowest work when it is locked.
+        let target = format!("{}:{query}", if source == "youtube" { "ytsearch8" } else { "scsearch10" });
         let data=self.run(&["--flat-playlist","--dump-single-json",&target],background).await?;
         let mut choices:Vec<_>=data["entries"].as_array().into_iter().flatten().filter_map(|v|candidate_from_metadata(v, source, t, false)).collect();
         choices.sort_by_key(|c|std::cmp::Reverse(c.score));
-        for c in choices.into_iter().take(4){if let Ok(Some(c))=self.enrich(c,t,background).await{return Ok(Some(c));}}
+        for choice in choices.into_iter().take(4) {
+            if let Ok(Some(candidate)) = self.enrich(choice, t, background).await {
+                return Ok(Some(candidate));
+            }
+        }
         Ok(None)
     }
     async fn enrich(&self,c:Candidate,t:&Track,background:bool)->Result<Option<Candidate>,()> {
@@ -564,6 +574,10 @@ impl AudioService {
         drop(io);
         if request.uri().query().is_some_and(|q|q.split('&').any(|p|p=="refresh=1")) {
             self.invalidate(&t.id).await?;
+        }
+        let wave = request.uri().query().is_some_and(|q| q.split('&').any(|p| p == "wave=1"));
+        if wave && self.is_recently_unavailable(&t.id) {
+            return Err(ApiError::full_audio_unavailable());
         }
         if let Some(candidate)=self.resolve(t).await? {
             if self.cached(&t.id).await?.is_some(){return Box::pin(self.stream(t,request)).await;}

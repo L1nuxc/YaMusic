@@ -903,8 +903,8 @@ function updatePlayerControls(): void {
   const t = player.current;
   const glyph = player.playing ? 'pause' : 'play';
   document.querySelectorAll<HTMLElement>('[data-playback-label]').forEach(el=>{
-    const loading = player.mode === 'loading';
-    const message = loading ? 'Находим аудио…' : player.mode === 'unavailable' ? 'Трек недоступен · попробуйте ещё раз' : '';
+    const loading = player.mode === 'loading' || player.seekingForPlayback;
+    const message = player.seekingForPlayback ? 'Перематываем…' : loading ? 'Находим аудио…' : player.mode === 'unavailable' ? 'Трек недоступен · попробуйте ещё раз' : '';
     el.parentElement!.classList.toggle('loading-audio', loading);
     if (el.textContent !== message) el.textContent = message;
   });
@@ -939,11 +939,29 @@ function fillRange(el: HTMLInputElement): void {
   el.style.setProperty('--range-fill', `${fill}%`);
   el.setAttribute('aria-valuetext', el.hasAttribute('data-volume') ? `${Math.round(Number(el.value) * 100)}%` : formatTime(Number(el.value)));
 }
+function updateBufferProgress(): void {
+  const buffered = player.mirroring ? undefined : player.audio.buffered;
+  const duration = player.duration;
+  const stops = ['var(--range-track) 0%'];
+  if (buffered && duration > 0) {
+    for (let index = 0; index < buffered.length; index++) {
+      const start = Math.min(100, buffered.start(index) / duration * 100);
+      const end = Math.min(100, buffered.end(index) / duration * 100);
+      stops.push(`var(--range-track) ${start}%, var(--range-buffer) ${start}% ${end}%, var(--range-track) ${end}%`);
+    }
+  }
+  stops.push('var(--range-track) 100%');
+  const layer = `linear-gradient(to right, ${stops.join(', ')})`;
+  for (const input of document.querySelectorAll<HTMLInputElement>('[data-seek]')) {
+    if (input.style.getPropertyValue('--range-buffer-background') !== layer) input.style.setProperty('--range-buffer-background', layer);
+  }
+}
 function updateProgress(): void {
   updateLyrics();
+  updateBufferProgress();
   document.querySelectorAll<HTMLInputElement>('[data-seek]').forEach(el => {
     el.max = String(player.duration);
-    el.value = String(player.time);
+    if (!el.matches(':active')) el.value = String(player.seekPosition);
     fillRange(el);
   });
   document.querySelectorAll('[data-elapsed]').forEach(el => el.textContent = formatTime(player.time));
@@ -2136,7 +2154,7 @@ document.addEventListener('input', event => {
     save();
   }
   else if (input.matches('[data-volume]')) { player.setVolume(Number(input.value)); if(!player.mirroring){library.settings.volume = player.volume;save();} fillRange(input); showCurrentVolume(input); }
-  else if (input.matches('[data-seek]')) { player.seek(Number(input.value)); fillRange(input); }
+  else if (input.matches('[data-seek]')) { fillRange(input); }
   else if (input.id === 'search-input') {
     clearTimeout(searchTimer); clearTimeout(searchHistoryTimer); searchRequest?.abort();
     if (searchResults && searchQuery !== input.value.trim()) rememberCurrentSearch();
@@ -2305,7 +2323,12 @@ mobileNav.addEventListener('pointerup',event=> {
 });
 mobileNav.addEventListener('click',event=> { if(Date.now()<suppressNavClickUntil) { event.preventDefault(); event.stopPropagation(); } },true);
 mobileNav.addEventListener('pointercancel',()=> { navPointer=undefined; mobileNav.classList.remove('dragging'); });
+document.addEventListener('change', event => {
+  const input = event.target;
+  if (input instanceof HTMLInputElement && input.matches('[data-seek]')) player.seek(input.valueAsNumber);
+});
 player.addEventListener('change',updatePlayerControls);
+player.addEventListener('bufferprogress',updateBufferProgress);
 player.addEventListener('tick',()=>{
   updateProgress();
   if(player.playing&&!player.mirroring)void persistPlayback();
@@ -2375,14 +2398,13 @@ player.addEventListener('playing',()=>{
 });
 player.addEventListener('playererror',event=>{
   const current=player.current;
-  if(player.context&&current&&player.mode==='unavailable'&&!failedWaveTracks.has(current.id)&&failedWaveTracks.size<5){
+  if(player.context&&current&&player.mode==='unavailable'&&!failedWaveTracks.has(current.id)){
     failedWaveTracks.add(current.id);
     player.next(false,false);
     return;
   }
   toast((event as CustomEvent<string>).detail);
 });
-player.addEventListener('playing',()=>failedWaveTracks.clear());
 player.addEventListener('playbacknotice',event=>toast((event as CustomEvent<string>).detail));
 window.addEventListener('hashchange',()=>{if(localDesktop)downloadsView();else navigate();});
 window.addEventListener('yamusic-session-expired',()=>{

@@ -363,7 +363,9 @@ fn materialize(ids:&[String],tracks:&[Track],blocked:&HashSet<String>)->Vec<Trac
 pub async fn start_wave(State(state):State<AppState>,headers:HeaderMap)->Result<Json<QueueResult>,ApiError>{
     bootstrap(&state,false).await;
     let _guard=state.recommendation_lock.lock().await;
-    let uid=user(&state,&headers).await?;let tracks=pool(&state).await?;let vectors=state.analysis.vectors.read().unwrap().clone();let taste=taste(&state,uid,&vectors).await?;let mut wave=WaveState{centroids:taste.centroids.clone(),..Default::default()};fill_wave(&mut wave,&tracks,&taste,&vectors);
+    let uid=user(&state,&headers).await?;let unavailable = state.audio.unavailable_tracks();
+    let tracks: Vec<_> = pool(&state).await?.into_iter().filter(|track| !unavailable.contains(&track.id)).collect();
+    let vectors=state.analysis.vectors.read().unwrap().clone();let taste=taste(&state,uid,&vectors).await?;let mut wave=WaveState{centroids:taste.centroids.clone(),..Default::default()};fill_wave(&mut wave,&tracks,&taste,&vectors);
     let id:String=sqlx::query_scalar("SELECT lower(hex(randomblob(16)))").fetch_one(&state.db).await?;
     sqlx::query("DELETE FROM wave_sessions WHERE updated_at<datetime('now','-1 day') OR (user_id=? AND id IN (SELECT id FROM wave_sessions WHERE user_id=? ORDER BY updated_at DESC LIMIT -1 OFFSET 4))").bind(uid).bind(uid).execute(&state.db).await?;
     sqlx::query("INSERT INTO wave_sessions(id,user_id,state_json) VALUES (?,?,?)").bind(&id).bind(uid).bind(serde_json::to_string(&wave).unwrap()).execute(&state.db).await?;
@@ -384,7 +386,11 @@ pub async fn next_wave(State(state):State<AppState>,headers:HeaderMap,Path(id):P
     }else if !wave.recent.contains(&body.current_id){return Err(ApiError::bad_request("Песня не относится к этой волне."));}
     if wave.recent.len()>30{wave.recent.drain(..wave.recent.len()-30);}
     wave.feedback.retain(|id|wave.recent.contains(id)||wave.queue.contains(id));
-    let tracks=pool(&state).await?;let vectors=state.analysis.vectors.read().unwrap().clone();let taste=taste(&state,uid,&vectors).await?;
+    let unavailable = state.audio.unavailable_tracks();
+    wave.queue.retain(|id| id == &body.current_id || !unavailable.contains(id));
+    let tracks: Vec<_> = pool(&state).await?.into_iter()
+        .filter(|track| track.id == body.current_id || !unavailable.contains(&track.id)).collect();
+    let vectors=state.analysis.vectors.read().unwrap().clone();let taste=taste(&state,uid,&vectors).await?;
     if wave.centroids!=taste.centroids {
         wave.centroids=taste.centroids.clone();
         wave.muted_clusters.clear();

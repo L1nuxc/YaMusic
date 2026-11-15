@@ -60,6 +60,11 @@ export class Player extends EventTarget {
   private sequence = 0;
   private streamBuffers = new WeakMap<HTMLAudioElement, { id: string; token: string; continued: boolean }>();
   private pendingSeek?: number;
+  private seekingTo?: number;
+  private seekDownload?: AbortController;
+  private seekObjectUrl?: string;
+  get seekPosition(): number { return this.pendingSeek ?? this.time; }
+  get seekingForPlayback(): boolean { return this.pendingSeek !== undefined; }
   private audioContext?: AudioContext;
   private analyser?: AnalyserNode;
   private frequencies?: Uint8Array<ArrayBuffer>;
@@ -116,27 +121,40 @@ export class Player extends EventTarget {
       if (this.retryTime > 0) {
         this.pendingSeek = this.retryTime;
         this.retryTime = 0;
-        this.applyPendingSeek();
       }
+      this.applyPendingSeek();
       this.tick();
     });
     on('durationchange', () => this.applyPendingSeek());
-    on('progress', () => this.applyPendingSeek());
+    on('progress', () => this.dispatchEvent(new Event('bufferprogress')));
     on('timeupdate', () => { this.tick(); this.updateCrossfade(); });
     on('seeking', () => { this.cancelCrossfade(); this.listening.anchor(this.time,performance.now()); });
     on('seeked', () => {
+      const target = this.seekingTo;
+      this.seekingTo = undefined;
+      if (target !== undefined && this.pendingSeek === target) {
+        if (Math.abs(audio.currentTime - target) > 0.5 && !this.seekObjectUrl) {
+          this.downloadForSeek();
+          return;
+        }
+        this.pendingSeek = undefined;
+        this.change();
+        this.tick();
+      }
       this.listening.anchor(this.time,performance.now());
       this.dispatchEvent(new Event('seeked'));
     });
-    on('ended', () => { if (!this.commitCrossfade()) this.next(true); });
+    on('ended', () => { if (!this.seekDownload && !this.commitCrossfade()) this.next(true); });
     on('error', () => {
       this.cancelCrossfade();
       // Signed CDN links can be revoked before their advertised expiry. Renew
       // once, retaining position; never leave the player in a retry loop.
+      if (this.seekDownload) return;
       const established = this.audio.readyState >= 1 || this.time > 0 || this.mode === 'full';
       if (this.current && established && this.retryCount++ === 0) {
         const resume = !this.audio.paused || this.loading || this.playing;
-        this.retryTime = this.time;
+        this.retryTime = this.seekPosition;
+        this.clearSeek();
         this.loading = resume; this.playing = false;
         this.audio.src = this.streamUrl(this.current.id, this.audio, true, this.retryTime > 0);
         this.change();
@@ -183,6 +201,7 @@ export class Player extends EventTarget {
   }
   reset(): void {
     this.remote=undefined;
+    this.clearSeek();
     this.cancelCrossfade();
     this.sequence++;
     this.queue=[];this.originalOrder=[];this.index=-1;this.context=undefined;
@@ -191,6 +210,7 @@ export class Player extends EventTarget {
   }
   private load(autoplay = true, position = 0): void {
     const track = this.current; if (!track) return;
+    this.clearSeek();
     this.cancelCrossfade();
     this.sequence++;
     this.mode='loading';
@@ -307,6 +327,7 @@ export class Player extends EventTarget {
     if (offline) return offline;
     const params = new URLSearchParams();
     if (refresh) params.set('refresh', '1');
+    else if (this.context) params.set('wave', '1');
     if (!full && (this.queue.find(track => track.id === id)?.duration_sec ?? 0) > FULL_BUFFER_AFTER) {
       const token = crypto.randomUUID();
       this.streamBuffers.set(audio, { id, token, continued: false });
@@ -322,13 +343,72 @@ export class Player extends EventTarget {
       .then(response => { if (!response.ok) throw new Error('Unable to continue buffering'); })
       .catch(() => { buffer.continued = false; });
   }
-  private applyPendingSeek(): void {
-    const position = this.pendingSeek;
-    if (position === undefined || !Number.isFinite(this.audio.duration)) return;
-    // Fragmented audio may temporarily report the length of its first fragment.
-    if (position > this.audio.duration && this.audio.duration + 4 < this.duration) return;
+  private clearSeek(): void {
+    this.seekDownload?.abort();
+    this.seekDownload = undefined;
+    if (this.seekObjectUrl) URL.revokeObjectURL(this.seekObjectUrl);
+    this.seekObjectUrl = undefined;
     this.pendingSeek = undefined;
-    this.audio.currentTime = Math.min(position, this.audio.duration);
+    this.seekingTo = undefined;
+  }
+  private applyPendingSeek(): void {
+    const target = this.pendingSeek;
+    if (target === undefined || this.seekingTo === target || this.seekDownload || this.audio.readyState === 0 && !Number.isFinite(this.audio.duration)) return;
+    const { seekable, duration } = this.audio;
+    let canSeek = Boolean(this.seekObjectUrl || this.offlineSource?.(this.current?.id ?? '') || !seekable);
+    for (let index = 0; seekable && index < seekable.length; index++) {
+      if (target >= seekable.start(index) && target <= seekable.end(index) + 0.3) canSeek = true;
+    }
+    if (!canSeek || !Number.isFinite(duration)) {
+      this.downloadForSeek();
+      return;
+    }
+    if (target >= FULL_BUFFER_AFTER) this.continueBuffering();
+    const position = Math.min(target, duration);
+    if (Math.abs(this.audio.currentTime - position) < 0.01) {
+      this.pendingSeek = undefined;
+      return;
+    }
+    this.pendingSeek = position;
+    this.seekingTo = position;
+    this.audio.currentTime = position;
+    // Simple media mocks and browsers returning immediately from a no-op seek.
+    if (!this.audio.seeking && Math.abs(this.audio.currentTime - position) < 0.01) {
+      this.pendingSeek = undefined;
+      this.seekingTo = undefined;
+    }
+  }
+  private downloadForSeek(): void {
+    const track = this.current;
+    if (!track || this.remote || this.seekDownload || this.seekObjectUrl || this.offlineSource?.(track.id)) return;
+    const controller = new AbortController();
+    const audio = this.audio;
+    const resume = !audio.paused || audio.ended || (this.loading && !this.playing);
+    this.seekDownload = controller;
+    this.change();
+    void fetch(`/api/stream/${encodeURIComponent(track.id)}`, {
+      signal: AbortSignal.any([controller.signal, AbortSignal.timeout(45000)]),
+    }).then(async response => {
+      if (!response.ok || !response.headers.get('Content-Type')?.startsWith('audio/')) throw new Error('Audio unavailable');
+      const body = await response.blob();
+      if (controller.signal.aborted) return;
+      this.seekObjectUrl = URL.createObjectURL(body);
+      this.streamBuffers.delete(audio);
+      const shouldPlay = !audio.paused || (resume && audio.ended);
+      this.seekingTo = undefined;
+      audio.src = this.seekObjectUrl;
+      // Keep the desired position through the source change and let metadata seek before playback.
+      this.seekDownload = undefined;
+      if (shouldPlay) this.resume();
+    }).catch(() => {
+      if (controller.signal.aborted) return;
+      this.seekDownload = undefined;
+      this.pendingSeek = undefined;
+      this.seekingTo = undefined;
+      this.change();
+      this.tick();
+      this.dispatchEvent(new CustomEvent('playbacknotice', { detail: 'Не удалось загрузить выбранный участок трека.' }));
+    });
   }
   private applyVolumes(progress = 0): void {
     const set = (audio: HTMLAudioElement, level: number) => {
@@ -348,12 +428,13 @@ export class Player extends EventTarget {
     return nextIndex(this.index,this.queue.length,this.context?'off':this.repeat,false,true);
   }
   private updateCrossfade(): void {
-    if(!this.fadeSeconds || !this.playing || this.audio.paused || this.audio.seeking || !Number.isFinite(this.audio.duration))return;
+    if(this.pendingSeek !== undefined || !this.fadeSeconds || !this.playing || this.audio.paused || this.audio.seeking || !Number.isFinite(this.audio.duration))return;
     const index=this.followingIndex();
     const track=index===null||index===this.index?undefined:this.queue[index];
     if(!track){if(this.prepared)this.cancelCrossfade();return;}
     if(this.prepared && this.prepared.trackId!==track.id)this.cancelCrossfade();
-    const remaining=this.duration-this.audio.currentTime;
+    const duration = this.audio.duration + 4 >= this.duration ? this.audio.duration : this.duration;
+    const remaining=duration-this.audio.currentTime;
     if(!this.prepared && remaining<=this.fadeSeconds+12 && remaining>0){
       if(!this.spare){
         this.spare=new Audio();
@@ -381,7 +462,7 @@ export class Player extends EventTarget {
     void prepared.audio.play().then(()=>{
       if(this.prepared!==prepared||prepared.failed)return;
       if(this.audio.paused||this.audio.ended){this.cancelCrossfade();return;}
-      const left=this.duration-this.audio.currentTime;
+      const left=duration-this.audio.currentTime;
       if(left<.15){this.cancelCrossfade();return;}
       this.fade={start:this.audio.currentTime,duration:left};
       this.updateCrossfade();
@@ -412,6 +493,7 @@ export class Player extends EventTarget {
       this.queue[index]?.id!==prepared.trackId)return false;
     this.finish(true);
     const outgoing=this.audio;
+    this.clearSeek();
     this.audio=prepared.audio;this.spare=outgoing;this.index=index;
     this.prepared=undefined;
     this.cancelCrossfade();
@@ -433,6 +515,7 @@ export class Player extends EventTarget {
     this.remote={...playback,sampledAt:performance.now()};
     if(entering) {
       this.sequence++;
+      this.clearSeek();
       this.cancelCrossfade();
       this.audio.pause();this.audio.removeAttribute('src');this.audio.load();
       this.restoredPosition=undefined;this.retryTime=0;this.pendingSeek=undefined;
@@ -495,10 +578,8 @@ export class Player extends EventTarget {
       this.restoredPosition=Math.max(0,Math.min(this.duration,time));
       this.tick();this.dispatchEvent(new Event('resume-position'));return;
     }
+    if (!Number.isFinite(time)) return;
     this.pendingSeek = Math.max(0, Math.min(this.duration, time));
-    if (this.pendingSeek >= FULL_BUFFER_AFTER || !Number.isFinite(this.audio.duration) || this.pendingSeek > this.audio.duration) {
-      this.continueBuffering();
-    }
     this.applyPendingSeek();
     this.tick();
   }
@@ -534,7 +615,7 @@ export class Player extends EventTarget {
   private change(): void { this.dispatchEvent(new Event('change')); }
   private tick(): void {
     this.listening.sample(this.time,performance.now(),!this.audio.paused,this.audio.seeking);
-    if (!this.finished && (this.listening.seconds >= FULL_BUFFER_AFTER || this.pendingSeek !== undefined)) this.continueBuffering();
+    if (!this.finished && this.listening.seconds >= FULL_BUFFER_AFTER) this.continueBuffering();
     const duration=this.current?.duration_sec||this.duration;
     if(!this.completed&&this.mode==='full'&&this.listening.ratio(duration)>0.8){this.completed=true;this.reaction('complete');}
     this.dispatchEvent(new Event('tick'));
