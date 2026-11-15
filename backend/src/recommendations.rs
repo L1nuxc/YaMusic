@@ -269,10 +269,6 @@ async fn taste(state:&AppState,uid:i64,vectors:&HashMap<String,Vector>)->Result<
     result.editorial=sqlx::query_scalar("SELECT e.track_id FROM editorial_tracks e JOIN tracks t ON t.id=e.track_id WHERE EXISTS (SELECT 1 FROM editorial_artists a WHERE a.artist_id=t.artist_id)").fetch_all(&state.db).await?.into_iter().collect();
     result.explicit_artists=sqlx::query_scalar("SELECT DISTINCT t.artist_id FROM tracks t JOIN interactions i ON i.track_id=t.id WHERE i.user_id=? AND i.action_type IN ('like','complete')").bind(uid).fetch_all(&state.db).await?.into_iter().collect();
     result.cold_start=result.favorites.is_empty()&&result.weights.values().all(|w|*w<=0.);
-    if result.cold_start {
-        result.cached_audio=sqlx::query_scalar("SELECT track_id FROM audio_cache WHERE local_file_path IS NOT NULL AND file_size_bytes>0")
-            .fetch_all(&state.db).await?.into_iter().collect();
-    }
     let mut positives:Vec<_>=result.weights.iter().filter(|(id,w)|**w>0.&&!result.blocked.contains(*id)).filter_map(|(id,w)|vectors.get(id).map(|v|(id.clone(),v.clone(),*w))).collect();
     // Artist selection supplies a small real-audio prior, never fake listens or
     // likes. Several artists stay separate through the same K-Means pipeline.
@@ -326,11 +322,19 @@ fn rank(tracks:&[Track],taste:&Taste,vectors:&HashMap<String,Vector>,wave:&WaveS
         Some((t.clone(),similarity+artist_prior+editorial_prior+weight.clamp(-5.,3.)*0.04-penalty-negative*0.35,index))
     }).collect();scored.sort_by(|a,b|b.1.total_cmp(&a.1).then_with(||a.2.cmp(&b.2)));scored.into_iter().map(|(t,_,_)|t).collect()
 }
+async fn prepared_wave_audio(state: &AppState) -> Result<HashSet<String>, ApiError> {
+    Ok(sqlx::query_scalar("SELECT track_id FROM audio_cache WHERE local_file_path IS NOT NULL AND file_size_bytes > 0
+        UNION SELECT h.track_id FROM audio_heads h JOIN audio_resolutions r ON r.track_id = h.track_id
+        WHERE h.head_size > 0 AND r.expires_at > unixepoch('now') + 30
+        AND json_extract(r.candidate_json, '$.url') = h.stream_url")
+        .fetch_all(&state.db).await?.into_iter().collect())
+}
+
 fn fill_wave(wave:&mut WaveState,tracks:&[Track],taste:&Taste,vectors:&HashMap<String,Vector>){
     let mut ranked=rank(tracks,taste,vectors,wave);
     // Release old history for small catalogs, preserving the playing song.
     while ranked.len()+wave.queue.len()<6&&!wave.recent.is_empty(){wave.recent.remove(0);ranked=rank(tracks,taste,vectors,wave);}
-    if wave.queue.is_empty()&&taste.cold_start {
+    if wave.queue.is_empty() {
         if let Some(index)=ranked.iter().position(|track|taste.cached_audio.contains(&track.id)) {
             wave.queue.push(ranked.remove(index).id);
         }
@@ -347,6 +351,13 @@ fn fill_wave(wave:&mut WaveState,tracks:&[Track],taste:&Taste,vectors:&HashMap<S
         let mut next=None;
         for gap in (0..=recent_artists.len()).rev() {
             let excluded=&recent_artists[..gap];
+            if position == 1 {
+                if let Some(index) = primary.iter().position(|track| !excluded.contains(&track.artist_id)
+                    && taste.cached_audio.contains(&track.id)) {
+                    next = Some(primary.remove(index));
+                    break;
+                }
+            }
             if let Some(index)=primary.iter().position(|t|!excluded.contains(&t.artist_id)) {
                 next=Some(primary.remove(index));break;
             }
@@ -365,7 +376,9 @@ pub async fn start_wave(State(state):State<AppState>,headers:HeaderMap)->Result<
     let _guard=state.recommendation_lock.lock().await;
     let uid=user(&state,&headers).await?;let unavailable = state.audio.unavailable_tracks();
     let tracks: Vec<_> = pool(&state).await?.into_iter().filter(|track| !unavailable.contains(&track.id)).collect();
-    let vectors=state.analysis.vectors.read().unwrap().clone();let taste=taste(&state,uid,&vectors).await?;let mut wave=WaveState{centroids:taste.centroids.clone(),..Default::default()};fill_wave(&mut wave,&tracks,&taste,&vectors);
+    let vectors=state.analysis.vectors.read().unwrap().clone();let mut taste=taste(&state,uid,&vectors).await?;
+    taste.cached_audio = prepared_wave_audio(&state).await?;
+    let mut wave=WaveState{centroids:taste.centroids.clone(),..Default::default()};fill_wave(&mut wave,&tracks,&taste,&vectors);
     let id:String=sqlx::query_scalar("SELECT lower(hex(randomblob(16)))").fetch_one(&state.db).await?;
     sqlx::query("DELETE FROM wave_sessions WHERE updated_at<datetime('now','-1 day') OR (user_id=? AND id IN (SELECT id FROM wave_sessions WHERE user_id=? ORDER BY updated_at DESC LIMIT -1 OFFSET 4))").bind(uid).bind(uid).execute(&state.db).await?;
     sqlx::query("INSERT INTO wave_sessions(id,user_id,state_json) VALUES (?,?,?)").bind(&id).bind(uid).bind(serde_json::to_string(&wave).unwrap()).execute(&state.db).await?;
@@ -390,7 +403,9 @@ pub async fn next_wave(State(state):State<AppState>,headers:HeaderMap,Path(id):P
     wave.queue.retain(|id| id == &body.current_id || !unavailable.contains(id));
     let tracks: Vec<_> = pool(&state).await?.into_iter()
         .filter(|track| track.id == body.current_id || !unavailable.contains(&track.id)).collect();
-    let vectors=state.analysis.vectors.read().unwrap().clone();let taste=taste(&state,uid,&vectors).await?;
+    let vectors=state.analysis.vectors.read().unwrap().clone();let mut taste=taste(&state,uid,&vectors).await?;
+    taste.cached_audio = prepared_wave_audio(&state).await?;
+
     if wave.centroids!=taste.centroids {
         wave.centroids=taste.centroids.clone();
         wave.muted_clusters.clear();
